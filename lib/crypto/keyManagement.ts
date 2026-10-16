@@ -3,7 +3,14 @@ import { sha256 } from "@noble/hashes/sha256"
 import { scrypt } from "@noble/hashes/scrypt"
 import { randomBytes } from "@noble/hashes/utils"
 
-import { withChecksum } from "./addressChecksum"
+import {
+  isCanonicalSpendPubHex,
+  isContributoryBoxPubHex,
+  parseShieldedAddress,
+  SHIELDED_BODY_HEX,
+  SHIELDED_CHECKSUM_HEX,
+  withChecksum
+} from "./addressChecksum"
 import * as nacl from "tweetnacl"
 
 // Circuit v3 (#350): the address carries the circom-Poseidon spend pubkey the
@@ -75,14 +82,37 @@ export async function deriveShieldedAddress(
   return `paraloom1${withChecksum(body)}`
 }
 
+function extractValidatedShieldedBody(shieldedAddress: string): string {
+  if (!shieldedAddress.startsWith("paraloom1")) {
+    throw new Error("Invalid shielded address: missing paraloom1 prefix")
+  }
+  const rest = shieldedAddress.slice("paraloom1".length)
+  if (rest.length === SHIELDED_BODY_HEX + SHIELDED_CHECKSUM_HEX) {
+    const body = parseShieldedAddress(shieldedAddress)
+    if (!body) {
+      throw new Error("Invalid shielded address")
+    }
+    return body.toLowerCase()
+  }
+  if (rest.length === SHIELDED_BODY_HEX && /^[0-9a-fA-F]{128}$/.test(rest)) {
+    const boxPubHex = rest.slice(0, 64)
+    const spendPubHex = rest.slice(64, 128)
+    if (!isContributoryBoxPubHex(boxPubHex) || !isCanonicalSpendPubHex(spendPubHex)) {
+      throw new Error("Invalid shielded address: non-canonical or low-order public key")
+    }
+    return rest.toLowerCase()
+  }
+  throw new Error("Invalid shielded address")
+}
+
 /** The box (encryption) public key half of a v2 shielded address, hex. */
 export function addressBoxPubHex(shieldedAddress: string): string {
-  return shieldedAddress.replace(/^paraloom1/, "").slice(0, 64)
+  return extractValidatedShieldedBody(shieldedAddress).slice(0, 64)
 }
 
 /** The spend (commitment-binding) public key half of a v2 shielded address, hex. */
 export function addressSpendPubHex(shieldedAddress: string): string {
-  return shieldedAddress.replace(/^paraloom1/, "").slice(64, 128)
+  return extractValidatedShieldedBody(shieldedAddress).slice(64, 128)
 }
 
 export interface EncryptedWallet {

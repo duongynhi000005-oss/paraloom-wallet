@@ -274,6 +274,69 @@ export interface TransactSubmission {
   requestId: string
 }
 
+const MIN_I64 = -9223372036854775808n
+const MAX_I64 = 9223372036854775807n
+const MAX_U64 = 18446744073709551615n
+
+function assertU64(value: bigint, label: string): void {
+  if (value < 0n || value > MAX_U64) {
+    throw new Error(`${label} is out of u64 range`)
+  }
+}
+
+export function serializeTransactInputsJson(
+  inputs: [TransactSpendInput, TransactSpendInput]
+): string {
+  const parts = inputs.map((i, idx) => {
+    assertU64(i.amount, `transact input[${idx}].amount`)
+    return `{"amount":${i.amount.toString(10)},"privkey_hex":${JSON.stringify(
+      i.privkeyHex
+    )},"blinding_hex":${JSON.stringify(i.blindingHex)},"leaf_index":${JSON.stringify(
+      i.leafIndex
+    )},"path_hex":${JSON.stringify(i.pathHex)}}`
+  })
+  return `[${parts.join(",")}]`
+}
+
+export function serializeTransactOutputsJson(
+  outputs: [TransactOutputNote, TransactOutputNote]
+): string {
+  const parts = outputs.map((o, idx) => {
+    assertU64(o.amount, `transact output[${idx}].amount`)
+    return `{"amount":${o.amount.toString(10)},"pubkey_hex":${JSON.stringify(
+      o.pubkeyHex
+    )},"blinding_hex":${JSON.stringify(o.blindingHex)}}`
+  })
+  return `[${parts.join(",")}]`
+}
+
+export function serializeTransactSubmitBody(
+  rootHex: string,
+  extAmount: bigint,
+  recipientHex: string,
+  proofBundleJson: string,
+  ciphertexts: [string, string],
+  mintHex?: string
+): string {
+  if (extAmount < MIN_I64 || extAmount > MAX_I64) {
+    throw new Error("transact ext_amount is out of i64 range")
+  }
+  const bundle = JSON.parse(proofBundleJson)
+  const fields = [
+    `"recipient":${JSON.stringify(recipientHex)}`,
+    `"nullifiers":${JSON.stringify(bundle.nullifiers)}`,
+    `"output_commitments":${JSON.stringify(bundle.output_commitments)}`,
+    `"root":${JSON.stringify(rootHex)}`,
+    `"ext_amount":${extAmount.toString(10)}`,
+    `"proof":${JSON.stringify(bundle.proof)}`,
+    `"ciphertexts":${JSON.stringify(ciphertexts)}`
+  ]
+  if (mintHex) {
+    fields.push(`"mint":${JSON.stringify(mintHex)}`)
+  }
+  return `{${fields.join(",")}}`
+}
+
 /// POST a proven transact to the ingress. `proofBundleJson` is the exact JSON
 /// `proveTransact` returns ({ nullifiers, output_commitments, proof }); the
 /// wallet adds root / ext_amount / recipient / ciphertexts around it.
@@ -289,23 +352,20 @@ export async function submitTransact(
   // `recipientHex` is the recipient token account.
   mintHex?: string
 ): Promise<TransactSubmission> {
-  const bundle = JSON.parse(proofBundleJson)
-  const body: Record<string, unknown> = {
-    recipient: recipientHex,
-    nullifiers: bundle.nullifiers,
-    output_commitments: bundle.output_commitments,
-    root: rootHex,
-    ext_amount: Number(extAmount),
-    proof: bundle.proof,
-    ciphertexts
-  }
-  if (mintHex) body.mint = mintHex
+  const bodyJson = serializeTransactSubmitBody(
+    rootHex,
+    extAmount,
+    recipientHex,
+    proofBundleJson,
+    ciphertexts,
+    mintHex
+  )
   const headers: Record<string, string> = { "Content-Type": "application/json" }
   if (ingressToken) headers["Authorization"] = `Bearer ${ingressToken}`
   const res = await fetch(`${TRANSACT_INGRESS_URL}/transact/submit`, {
     method: "POST",
     headers,
-    body: JSON.stringify(body)
+    body: bodyJson
   })
   if (!res.ok) {
     throw new Error(`transact ingress rejected: ${res.status} ${await res.text()}`)
@@ -313,3 +373,4 @@ export async function submitTransact(
   const json = await res.json()
   return { requestId: json.request_id ?? json.requestId }
 }
+

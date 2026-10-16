@@ -223,6 +223,42 @@ export interface TransactProofOutput {
   blindingHex: string
 }
 
+function formatU64Literal(amount: bigint): string {
+  const v = BigInt(amount)
+  if (v < 0n || v > 0xffffffffffffffffn) {
+    throw new RangeError("note amount out of u64 range")
+  }
+  return v.toString(10)
+}
+
+export function serializeTransactInputsJson(
+  inputs: [TransactProofInput, TransactProofInput]
+): string {
+  return `[${inputs
+    .map(
+      (i) =>
+        `{"amount":${formatU64Literal(i.amount)},"privkey_hex":${JSON.stringify(
+          i.privkeyHex
+        )},"blinding_hex":${JSON.stringify(i.blindingHex)},"leaf_index":${JSON.stringify(
+          i.leafIndex
+        )},"path_hex":${JSON.stringify(i.pathHex)}}`
+    )
+    .join(",")}]`
+}
+
+export function serializeTransactOutputsJson(
+  outputs: [TransactProofOutput, TransactProofOutput]
+): string {
+  return `[${outputs
+    .map(
+      (o) =>
+        `{"amount":${formatU64Literal(o.amount)},"pubkey_hex":${JSON.stringify(
+          o.pubkeyHex
+        )},"blinding_hex":${JSON.stringify(o.blindingHex)}}`
+    )
+    .join(",")}]`
+}
+
 // Build the v3 transact proof in the extension (fixed 2-in/2-out; a padding
 // input has amount 0). Returns the raw prover JSON
 // ({ nullifiers, output_commitments, proof }) that `submitTransact` wraps
@@ -236,22 +272,8 @@ export async function proveTransact(
   outputs: [TransactProofOutput, TransactProofOutput]
 ): Promise<string> {
   const pk = await ensureTransactReady()
-  const inputsJson = JSON.stringify(
-    inputs.map((i) => ({
-      amount: Number(i.amount),
-      privkey_hex: i.privkeyHex,
-      blinding_hex: i.blindingHex,
-      leaf_index: i.leafIndex,
-      path_hex: i.pathHex
-    }))
-  )
-  const outputsJson = JSON.stringify(
-    outputs.map((o) => ({
-      amount: Number(o.amount),
-      pubkey_hex: o.pubkeyHex,
-      blinding_hex: o.blindingHex
-    }))
-  )
+  const inputsJson = serializeTransactInputsJson(inputs)
+  const outputsJson = serializeTransactOutputsJson(outputs)
   return prove_transact(
     pk,
     rootHex,
@@ -262,3 +284,4 @@ export async function proveTransact(
     outputsJson
   )
 }
+

@@ -12,7 +12,12 @@ import {
   PROGRAM_ID,
   TRANSACT_EVENT_DISCRIMINATOR
 } from "~lib/paraloom/constants"
-import { fetchV3Leaves } from "~lib/paraloom/transact"
+import {
+  fetchV3Leaves,
+  serializeTransactInputsJson,
+  serializeTransactOutputsJson,
+  serializeTransactSubmitBody
+} from "~lib/paraloom/transact"
 import { describe, expect, it, vi } from "vitest"
 
 // transact.ts now reaches ~lib/prover through bridge.ts, and the wasm module
@@ -363,3 +368,69 @@ describe("refusing an unsafe tree", () => {
     await expect(fetchV3Leaves(connection)).rejects.toThrow(/leaf history may be incomplete/)
   })
 })
+
+describe("exact 64-bit integer serialization above Number.MAX_SAFE_INTEGER", () => {
+  it("preserves exact u64 input and output amounts above 2^53 - 1 without IEEE-754 rounding", () => {
+    // Under IEEE-754 Number(x), 9007199254740993n (2^53 + 1) rounds down to
+    // 9007199254740992 and 9007199254740995n (2^53 + 3) rounds up to
+    // 9007199254740996, which would still conserve sum (2^54 + 4) while
+    // causing the proved on-chain commitment to diverge from the encrypted
+    // note and local change note.
+    const out0Amount = 9_007_199_254_740_993n
+    const out1Amount = 9_007_199_254_740_995n
+
+    const inputsJson = serializeTransactInputsJson([
+      {
+        amount: 9_007_199_254_740_992n,
+        privkeyHex: "11".repeat(32),
+        blindingHex: "22".repeat(32),
+        leafIndex: 0,
+        pathHex: ["33".repeat(32)]
+      },
+      {
+        amount: 9_007_199_254_740_996n,
+        privkeyHex: "44".repeat(32),
+        blindingHex: "55".repeat(32),
+        leafIndex: 1,
+        pathHex: ["66".repeat(32)]
+      }
+    ])
+    const outputsJson = serializeTransactOutputsJson([
+      {
+        amount: out0Amount,
+        pubkeyHex: "77".repeat(32),
+        blindingHex: "88".repeat(32)
+      },
+      {
+        amount: out1Amount,
+        pubkeyHex: "99".repeat(32),
+        blindingHex: "aa".repeat(32)
+      }
+    ])
+
+    expect(inputsJson).toContain('"amount":9007199254740992')
+    expect(inputsJson).toContain('"amount":9007199254740996')
+    expect(outputsJson).toContain('"amount":9007199254740993')
+    expect(outputsJson).toContain('"amount":9007199254740995')
+  })
+
+  it("serializes negative and positive i64 ext_amount values above 2^53 - 1 without rounding", () => {
+    const extAmount = -9_007_199_254_740_993n
+    const bundleJson = JSON.stringify({
+      nullifiers: ["11".repeat(32), "22".repeat(32)],
+      output_commitments: ["33".repeat(32), "44".repeat(32)],
+      proof: "55".repeat(256)
+    })
+    const bodyJson = serializeTransactSubmitBody(
+      "aa".repeat(32),
+      extAmount,
+      "bb".repeat(32),
+      bundleJson,
+      ["01" + "cc".repeat(144), "01" + "dd".repeat(144)]
+    )
+
+    expect(bodyJson).toContain('"ext_amount":-9007199254740993')
+    expect(bodyJson).not.toContain("-9007199254740992")
+  })
+})
+

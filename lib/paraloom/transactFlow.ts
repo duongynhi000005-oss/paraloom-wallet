@@ -208,6 +208,16 @@ export async function spendV3(
   }
   const change = sumIn - payLamports
 
+  // Validate recipient shielded address upfront (checksum, canonical BN254 spendPub,
+  // and contributory X25519 boxPub) before fetching leaves or building proofs.
+  const transferRecipientKeys =
+    dest.kind === "transfer"
+      ? {
+          spendPub: addressSpendPubHex(dest.recipientShielded),
+          boxPub: addressBoxPubHex(dest.recipientShielded)
+        }
+      : null
+
   // Asset (#779): every input in one transact shares a single asset. Native SOL
   // is the all-zero id; a shielded SPL note carries its mint-derived assetId and
   // the mint itself (needed to tell the node to settle via transact_spl).
@@ -297,8 +307,8 @@ export async function spendV3(
   } else {
     extAmount = 0n
     recipientHex = "00".repeat(32)
-    const toSpendPub = addressSpendPubHex(dest.recipientShielded)
-    const toBoxPub = addressBoxPubHex(dest.recipientShielded)
+    const toSpendPub = transferRecipientKeys!.spendPub
+    const toBoxPub = transferRecipientKeys!.boxPub
     const payBlind = randomHex32()
     outputs = [
       { amount: payLamports, pubkeyHex: toSpendPub, blindingHex: payBlind },

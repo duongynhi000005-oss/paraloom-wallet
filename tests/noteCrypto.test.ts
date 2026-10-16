@@ -248,4 +248,67 @@ describe("trial decryption", () => {
     bundle.set(ct, 57)
     expect(tryDecryptNote(RECIPIENT_SECRET, hex(bundle))).toBeNull()
   })
+
+  it.each([
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880"
+  ])(
+    "refuses low-order Curve25519 public key %s in both encryptNote and tryDecryptNote",
+    (lowOrderHex) => {
+      // Sender side: refuses to seal under the public all-zero shared secret
+      expect(() => encryptNote(lowOrderHex, NOTE)).toThrow(/low-order|non-contributory/)
+
+      // Recipient side: refuses a bundle forged with a low-order epk and HSalsa20(0^32, 0)
+      const lowOrderEpk = bytes(lowOrderHex)
+      const sharedKey = nacl.box.before(lowOrderEpk, RECIPIENT_SECRET)
+      const nonce = new Uint8Array(24).fill(0x55)
+      const pt = new Uint8Array(72)
+      new DataView(pt.buffer).setBigUint64(0, 5_000_000_000n, true)
+      const ct = nacl.box.after(pt, nonce, sharedKey)
+
+      const v1Forged = new Uint8Array(57 + ct.length)
+      v1Forged[0] = TAG_V1
+      v1Forged.set(lowOrderEpk, 1)
+      v1Forged.set(nonce, 33)
+      v1Forged.set(ct, 57)
+      expect(tryDecryptNote(RECIPIENT_SECRET, hex(v1Forged))).toBeNull()
+
+      const legacyForged = new Uint8Array(56 + ct.length)
+      legacyForged.set(lowOrderEpk, 0)
+      legacyForged.set(nonce, 32)
+      legacyForged.set(ct, 56)
+      expect(tryDecryptNote(RECIPIENT_SECRET, hex(legacyForged))).toBeNull()
+    }
+  )
+
+  it("preserves exact u64 amounts above 2^53 - 1 and rejects out-of-range amounts", () => {
+    const boxKeys = nacl.box.keyPair()
+    const largeAmount = 9_007_199_254_740_993n // 2^53 + 1 (unsafe for IEEE-754 Number)
+    const ctHex = encryptNote(hex(boxKeys.publicKey), {
+      ...NOTE,
+      amount: largeAmount
+    })
+    const opened = tryDecryptNote(boxKeys.secretKey, ctHex)
+    expect(opened?.amount).toBe(largeAmount)
+
+    expect(() =>
+      encryptNote(hex(boxKeys.publicKey), {
+        ...NOTE,
+        amount: -1n
+      })
+    ).toThrow(/u64 range/)
+    expect(() =>
+      encryptNote(hex(boxKeys.publicKey), {
+        ...NOTE,
+        amount: 1n << 64n
+      })
+    ).toThrow(/u64 range/)
+  })
 })
+

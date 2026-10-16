@@ -46,6 +46,9 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 function encodePlaintext(note: NotePlaintext): Uint8Array {
+  if (note.amount < 0n || note.amount > 0xffffffffffffffffn) {
+    throw new RangeError("Note amount out of u64 range")
+  }
   const pt = new Uint8Array(72)
   new DataView(pt.buffer).setBigUint64(0, note.amount, true) // amount, little-endian
   pt.set(hexToBytes(note.blindingHex), 8)
@@ -54,13 +57,45 @@ function encodePlaintext(note: NotePlaintext): Uint8Array {
 }
 
 /**
+ * Constant-time check that the X25519 Diffie-Hellman shared point is not the
+ * all-zero output produced by the 8 low-order Curve25519/twist points
+ * (paraloom-core#814). Without this check:
+ *  - `encryptNote` seals the note under the public constant key `HSalsa20(0^32, 0)`,
+ *    leaking the plaintext to any observer on `/transact/scan` while burning the
+ *    funds to an unspendable box key;
+ *  - `tryDecryptNote` accepts low-order ephemeral public keys (`epk`), allowing
+ *    universal MAC forgery across wallets.
+ */
+export function hasContributorySharedSecret(
+  secretKey: Uint8Array,
+  publicKey: Uint8Array
+): boolean {
+  if (secretKey.length !== 32 || publicKey.length !== 32) return false
+  const shared = nacl.scalarMult(secretKey, publicKey)
+  let diff = 0
+  for (let i = 0; i < shared.length; i++) {
+    diff |= shared[i]
+  }
+  return diff !== 0
+}
+
+/**
  * Encrypt `note` to `recipientBoxPubHex` (a 32-byte X25519 public key, i.e. the
  * recipient's shielded address bytes) under a fresh ephemeral key. Returns the
  * hex bundle to carry in the transfer's `ciphertexts`.
  */
 export function encryptNote(recipientBoxPubHex: string, note: NotePlaintext): string {
-  const recipientPub = hexToBytes(recipientBoxPubHex)
+  const cleanPub = recipientBoxPubHex.startsWith("0x")
+    ? recipientBoxPubHex.slice(2)
+    : recipientBoxPubHex
+  if (!/^[0-9a-fA-F]{64}$/.test(cleanPub)) {
+    throw new Error("Invalid recipient box public key hex")
+  }
+  const recipientPub = hexToBytes(cleanPub)
   const ephemeral = nacl.box.keyPair()
+  if (!hasContributorySharedSecret(ephemeral.secretKey, recipientPub)) {
+    throw new Error("Invalid or low-order recipient box public key")
+  }
   const nonce = randomBytes(nacl.box.nonceLength) // 24
   const ct = nacl.box(encodePlaintext(note), nonce, recipientPub, ephemeral.secretKey)
 
@@ -78,7 +113,12 @@ export function encryptNote(recipientBoxPubHex: string, note: NotePlaintext): st
  * every delivered note and silently skip the ones not for them).
  */
 export function tryDecryptNote(boxSecretKey: Uint8Array, bundleHex: string): NotePlaintext | null {
-  const bundle = hexToBytes(bundleHex)
+  if (typeof bundleHex !== "string") return null
+  const clean = bundleHex.startsWith("0x") ? bundleHex.slice(2) : bundleHex
+  if (clean.length === 0 || clean.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(clean)) {
+    return null
+  }
+  const bundle = hexToBytes(clean)
 
   // Parse the v1-tagged envelope (epk at offset 1) and, for notes delivered
   // before the tag was added, the legacy untagged one (epk at offset 0). When
@@ -89,6 +129,7 @@ export function tryDecryptNote(boxSecretKey: Uint8Array, bundleHex: string): Not
   for (const off of offsets) {
     if (bundle.length < off + 56 + 16) continue
     const epk = bundle.slice(off, off + 32)
+    if (!hasContributorySharedSecret(boxSecretKey, epk)) continue
     const nonce = bundle.slice(off + 32, off + 56)
     const ct = bundle.slice(off + 56)
     const pt = nacl.box.open(ct, nonce, epk, boxSecretKey)
@@ -102,3 +143,4 @@ export function tryDecryptNote(boxSecretKey: Uint8Array, bundleHex: string): Not
   }
   return null
 }
+
