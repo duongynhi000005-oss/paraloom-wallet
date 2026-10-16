@@ -8,7 +8,16 @@ import { deriveKeypairFromSeed, decryptWallet, decryptSeedPhrase, deriveBoxKeypa
 import { getStoredWallet } from "~lib/storage/secure"
 import type { Account } from "~lib/store/walletStore"
 import { getConnection, deposit, getSolBalance, solanaAddress, solanaAddressToBytes } from "~lib/paraloom/bridge"
-import { addNote, getNotes, markNoteSpent, shieldedBalance, shieldedTokenBalances, type ShieldedNote } from "~lib/paraloom/notes"
+import {
+  addNote,
+  getNotes,
+  getPendingSpends,
+  markNoteSpent,
+  reconcilePendingSpends,
+  shieldedBalance,
+  shieldedTokenBalances,
+  type ShieldedNote
+} from "~lib/paraloom/notes"
 
 // Known shielded SPL tokens for display; unknown mints fall back to a truncated
 // mint and raw base units.
@@ -17,6 +26,7 @@ const SHIELDED_TOKEN_META: Record<string, { symbol: string; decimals: number }> 
 }
 import { withdraw } from "~lib/paraloom/withdraw"
 import { transfer } from "~lib/paraloom/transfer"
+import { fetchV3Leaves } from "~lib/paraloom/transact"
 import { depositV3, spendV3 } from "~lib/paraloom/transactFlow"
 import { NATIVE_ASSET_HEX } from "~lib/prover"
 import { addressBoxPubHex } from "~lib/crypto/keyManagement"
@@ -330,6 +340,18 @@ export function Home({ onLock }: HomeProps) {
       }
     } catch {
       // best-effort
+    }
+    try {
+      const pending = await getPendingSpends(wallet.shieldedAddress)
+      if (pending.length > 0) {
+        const leaves = await fetchV3Leaves(getConnection(network))
+        await reconcilePendingSpends(
+          wallet.shieldedAddress,
+          new Set(leaves.map((l) => l.commitmentHex))
+        )
+      }
+    } catch {
+      // best-effort — spendV3 and dropPhantomNotes also reconcile against fresh leaves
     }
     try {
       setShieldedLamports(await shieldedBalance(wallet.shieldedAddress))

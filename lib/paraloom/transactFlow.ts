@@ -18,7 +18,12 @@ import { NATIVE_ASSET_HEX } from "~lib/prover"
 import { encryptNote } from "./noteCrypto"
 import {
   addNote,
+  finalizePendingSpend,
+  getNotes,
   markNoteSpentByIdentity,
+  reconcilePendingSpends,
+  removePendingSpend,
+  savePendingSpend,
   setNoteLeafIndex,
   type ShieldedNote
 } from "./notes"
@@ -107,10 +112,15 @@ export async function depositV3(
     }
   )
 
-  // Read our leaf index from the event this deposit emitted.
-  const tx = await connection.getTransaction(signature, {
-    maxSupportedTransactionVersion: 0
-  })
+  // Read our leaf index from the event this deposit emitted. Retry
+  // getTransaction a few times because RPC block/transaction indexing can lag
+  // behind getSignatureStatus confirmation.
+  let tx = null
+  for (let attempt = 0; attempt < 3 && !tx; attempt++) {
+    tx = await connection.getTransaction(signature, {
+      maxSupportedTransactionVersion: 0
+    })
+  }
   let leafIndex = -1
   for (const line of tx?.meta?.logMessages ?? []) {
     const m = line.match(/^Program log: Deposit note appended at leaf (\d+)$/)
@@ -118,26 +128,30 @@ export async function depositV3(
   }
   if (leafIndex < 0) {
     // Fallback: locate our commitment in the rebuilt leaf list.
-    const leaves = await fetchV3Leaves(connection)
-    leafIndex = leaves.findIndex((l) => l.commitmentHex === commitment)
+    try {
+      const leaves = await fetchV3Leaves(connection)
+      leafIndex = leaves.findIndex((l) => l.commitmentHex === commitment)
+    } catch {
+      // Best-effort — ensureLeafIndex will resolve the index by commitment at spend time.
+    }
   }
-  if (leafIndex < 0) {
-    // The note is already persisted (above) and spendable — ensureLeafIndex will
-    // resolve the index by commitment at spend time — so surface the lookup miss
-    // without losing the deposit.
-    throw new Error("deposit confirmed but leaf index not found")
+  if (leafIndex >= 0) {
+    // Finalize the persisted note with its now-known leaf index, saving
+    // ensureLeafIndex a full-history rebuild at spend time. When RPC indexing
+    // lags and leafIndex is still < 0, do not throw on a confirmed deposit: the
+    // note is already persisted with its commitment and ensureLeafIndex resolves
+    // its index at spend time.
+    await setNoteLeafIndex(shieldedAddress, commitment, leafIndex)
   }
-
-  // Finalize the persisted note with its now-known leaf index, saving
-  // ensureLeafIndex a full-history rebuild at spend time.
-  await setNoteLeafIndex(shieldedAddress, commitment, leafIndex)
   return { signature, leafIndex }
 }
 
 /// Locate a note's leaf index by its commitment (for received notes that were
-/// scanned from ciphertexts and carry no index).
+/// scanned from ciphertexts and carry no index, or deposits whose leaf index
+/// was not yet indexed at deposit confirmation time).
 async function ensureLeafIndex(
   connection: Connection,
+  shieldedAddress: string,
   note: ShieldedNote,
   spendPrivkeyHex: string,
   // Leaves already rebuilt by the caller THIS instant (same tree snapshot), so
@@ -152,12 +166,16 @@ async function ensureLeafIndex(
   // note's leaf binds its mint-derived assetId, not the native all-zero one, so
   // a native-only commitment would never match its on-chain leaf.
   const commitment =
-    note.assetId && note.assetId !== NATIVE_ASSET_HEX
+    note.commitment ||
+    (note.assetId && note.assetId !== NATIVE_ASSET_HEX
       ? await v3NoteCommitmentAsset(BigInt(note.amount), pubkeyHex, note.blinding, note.assetId)
-      : await v3NoteCommitment(BigInt(note.amount), pubkeyHex, note.blinding)
+      : await v3NoteCommitment(BigInt(note.amount), pubkeyHex, note.blinding))
   const leaves = cachedLeaves ?? (await fetchV3Leaves(connection))
   const idx = leaves.findIndex((l) => l.commitmentHex === commitment)
   if (idx < 0) throw new Error("note commitment not found in the on-chain tree")
+  if (note.source === "deposit" && commitment) {
+    await setNoteLeafIndex(shieldedAddress, commitment, idx)
+  }
   return idx
 }
 
@@ -229,6 +247,26 @@ export async function spendV3(
   // folds to is the root the proof cites.
   const leaves = await fetchV3Leaves(connection)
   const leavesHex = leaves.map((l) => l.commitmentHex)
+
+  // Reconcile any prior pending spends that settled after a popup close, worker
+  // eviction, or poll timeout before proving against `inputs`, so an input note
+  // that was already consumed on-chain is marked spent instead of causing a
+  // duplicate-nullifier rejection.
+  const reconciled = await reconcilePendingSpends(shieldedAddress, new Set(leavesHex))
+  if (reconciled > 0) {
+    const latestNotes = await getNotes(shieldedAddress)
+    for (const input of inputs) {
+      const match = latestNotes.find((n) =>
+        input.commitment
+          ? n.commitment === input.commitment
+          : Boolean(input.signature) && n.signature === input.signature
+      )
+      if (match?.spent) {
+        throw new Error("selected note was already spent in a prior settled transaction")
+      }
+    }
+  }
+
   const inputSpecs = [] as {
     amount: bigint
     privkeyHex: string
@@ -240,7 +278,7 @@ export async function spendV3(
   for (const note of inputs) {
     // Reuse the leaves rebuilt just above (same snapshot) instead of paging the
     // whole chain history again per input note.
-    const leafIndex = await ensureLeafIndex(connection, note, spendPrivkeyHex, leaves)
+    const leafIndex = await ensureLeafIndex(connection, shieldedAddress, note, spendPrivkeyHex, leaves)
     const { path, root } = await v3MerklePath(leavesHex, leafIndex)
     rootHex = root
     inputSpecs.push({
@@ -327,15 +365,60 @@ export async function spendV3(
     [outputs[0], outputs[1]] as never
   )
 
-  const { requestId } = await submitTransact(
-    rootHex,
-    extAmount,
-    recipientHex,
-    bundle,
-    ciphertexts,
-    opts.ingressToken,
-    mintHex
+  const settleCommitmentHex = await noteCommitment(
+    outputs[0].amount,
+    outputs[0].pubkeyHex,
+    outputs[0].blindingHex
   )
+  const changeCommitmentHex =
+    change > 0n
+      ? dest.kind === "withdraw"
+        ? settleCommitmentHex
+        : await noteCommitment(change, ownPubHex, changeBlind)
+      : undefined
+  const changeNote: ShieldedNote | undefined =
+    change > 0n && changeCommitmentHex
+      ? {
+          amount: change.toString(),
+          blinding: changeBlind,
+          assetId: assetIdHex,
+          mint: isSpl ? inputs[0].mint : undefined,
+          signature: "",
+          createdAt: Date.now(),
+          spent: false,
+          source: "transfer",
+          commitment: changeCommitmentHex
+        }
+      : undefined
+
+  // Persist the pending spend (inputs + settleCommitmentHex + changeNote with
+  // changeBlind) BEFORE submitting to the ingress. If the popup is closed, the
+  // MV3 service worker is terminated, or the quorum settles after the client
+  // poll timeout, reconcilePendingSpends can still mark the consumed inputs
+  // spent and book the change note once settleCommitmentHex appears on-chain.
+  await savePendingSpend(shieldedAddress, {
+    settleCommitmentHex,
+    inputs,
+    changeNote,
+    createdAt: Date.now()
+  })
+
+  let requestId: string
+  try {
+    const sub = await submitTransact(
+      rootHex,
+      extAmount,
+      recipientHex,
+      bundle,
+      ciphertexts,
+      opts.ingressToken,
+      mintHex
+    )
+    requestId = sub.requestId
+  } catch (err) {
+    await removePendingSpend(shieldedAddress, settleCommitmentHex)
+    throw err
+  }
 
   // Wait until the spend actually settles before touching local bookkeeping.
   // submitTransact only returns a queue ticket — the ingress accepts the request
@@ -346,11 +429,6 @@ export async function spendV3(
   // on-chain — corrupting the balance in both directions with no self-healing
   // path (paraloom-core#792). The signal is the first output commitment landing
   // in the tree; a withdraw caller supplies a cheaper recipient-funded check.
-  const settleCommitmentHex = await noteCommitment(
-    outputs[0].amount,
-    outputs[0].pubkeyHex,
-    outputs[0].blindingHex
-  )
   const settled = opts.confirmSettled
     ? await opts.confirmSettled()
     : await confirmSettledByTree(connection, settleCommitmentHex)
@@ -365,23 +443,15 @@ export async function spendV3(
     // commitment forces ensureLeafIndex to locate the note by commitment against
     // a fresh rebuild at spend time, which is authoritative. (Deposit notes keep
     // their index because it comes from the on-chain event and never moves.)
+    await finalizePendingSpend(shieldedAddress, settleCommitmentHex)
     for (const note of inputs) {
       await markNoteSpentByIdentity(shieldedAddress, note)
     }
-    if (change > 0n) {
-      await addNote(shieldedAddress, {
-        amount: change.toString(),
-        blinding: changeBlind,
-        assetId: assetIdHex,
-        mint: isSpl ? inputs[0].mint : undefined,
-        signature: "",
-        createdAt: Date.now(),
-        spent: false,
-        source: "transfer",
-        commitment: await noteCommitment(change, ownPubHex, changeBlind)
-      })
+    if (changeNote) {
+      await addNote(shieldedAddress, changeNote)
     }
   }
 
   return { requestId, changeLamports: change, settled }
 }
+

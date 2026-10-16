@@ -3,7 +3,16 @@ import { Connection, PublicKey } from "@solana/web3.js"
 import { getAutoLockMinutes, getStoredWallet, isWalletLocked, setLockState } from "~lib/storage/secure"
 import { addApprovedOrigin, isOriginApproved, removeApprovedOrigin } from "~lib/storage/connections"
 import { clearSession, getLastActivity, loadSession, recordActivity } from "~lib/storage/session"
-import { addNote, getNotes, markNoteSpentByCommitment, shieldedBalance, shieldedTokenBalances, type ShieldedNote } from "~lib/paraloom/notes"
+import {
+  addNote,
+  getNotes,
+  getPendingSpends,
+  markNoteSpentByCommitment,
+  reconcilePendingSpends,
+  shieldedBalance,
+  shieldedTokenBalances,
+  type ShieldedNote
+} from "~lib/paraloom/notes"
 import { scanForNotes } from "~lib/paraloom/scan"
 import {
   associatedTokenAddress,
@@ -812,7 +821,8 @@ async function dropPhantomNotes(
       !!n.commitment &&
       Date.now() - n.createdAt > GRACE_MS
   )
-  if (suspects.length === 0) return notes
+  const pendingSpends = await getPendingSpends(account)
+  if (suspects.length === 0 && pendingSpends.length === 0) return notes
 
   let onchain: Set<string>
   try {
@@ -820,6 +830,22 @@ async function dropPhantomNotes(
     onchain = new Set(leaves.map((l) => l.commitmentHex))
   } catch {
     return notes // cannot rebuild the tree safely — drop nothing
+  }
+
+  let currentNotes = notes
+  if (pendingSpends.length > 0) {
+    const reconciled = await reconcilePendingSpends(account, onchain)
+    if (reconciled > 0) {
+      const wantedAssetIds = new Set(
+        notes.map((n) => n.assetId || NATIVE_ASSET_HEX)
+      )
+      currentNotes = (await getNotes(account)).filter(
+        (n) =>
+          !n.spent &&
+          (wantedAssetIds.size === 0 ||
+            wantedAssetIds.has(n.assetId || NATIVE_ASSET_HEX))
+      )
+    }
   }
 
   const dropped = new Set<string>()
@@ -834,7 +860,7 @@ async function dropPhantomNotes(
       `[paraloom] reconciled ${dropped.size} phantom note(s) not present on-chain`
     )
   }
-  return notes.filter((n) => !(n.commitment && dropped.has(n.commitment)))
+  return currentNotes.filter((n) => !(n.commitment && dropped.has(n.commitment)))
 }
 
 // The actual spend. Runs only after handlePrivateSwapRequest approved it.

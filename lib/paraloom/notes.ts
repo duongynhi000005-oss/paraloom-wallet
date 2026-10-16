@@ -50,11 +50,14 @@ export async function getNotes(account: string): Promise<ShieldedNote[]> {
 export async function addNote(account: string, note: ShieldedNote): Promise<void> {
   const all = await readAll()
   const existing = all[account] ?? []
-  // Idempotent by (non-empty) deposit signature: the same shielded note can be
-  // persisted more than once — the early on-submit persist AND the end-of-flow
-  // persist AND the recovery scan all target the same deposit — so dedupe here
-  // rather than double-counting the balance.
+  // Idempotent by (non-empty) deposit signature or commitment: the same
+  // shielded note can be persisted more than once — the early on-submit persist
+  // AND the end-of-flow persist AND the recovery/transfer scan all target the
+  // same note — so dedupe here rather than double-counting the balance.
   if (note.signature && existing.some((n) => n.signature === note.signature)) {
+    return
+  }
+  if (note.commitment && existing.some((n) => n.commitment === note.commitment)) {
     return
   }
   all[account] = [...existing, note]
@@ -154,3 +157,125 @@ export async function shieldedTokenBalances(
   }
   return byMint
 }
+
+// Pre-confirmation record of a submitted v3 spend. Persisted before/upon
+// submitTransact so that if the popup closes, the MV3 worker is evicted, or the
+// quorum settles after the client poll timeout, the wallet still knows which
+// inputs were committed to the spend and retains the freshly generated change
+// blinding secret (`changeNote.blinding`).
+export interface PendingSpend {
+  // First output commitment (`outputs[0]`) of the submitted transact. On-chain
+  // `transact` / `transact_spl` atomically records both input nullifiers and
+  // appends both output commitments (`oc0`, `oc1`), so `settleCommitmentHex`
+  // appearing in `fetchV3Leaves` is authoritative proof that `inputs` were
+  // consumed and `changeNote` (if any) landed on-chain.
+  settleCommitmentHex: string
+  inputs: ShieldedNote[]
+  changeNote?: ShieldedNote
+  createdAt: number
+}
+
+const PENDING_SPENDS_KEY = "paraloom_pending_spends"
+export const PENDING_SPEND_EXPIRY_MS = 300_000
+
+type PendingSpendsByAccount = Record<string, PendingSpend[]>
+
+async function readAllPendingSpends(): Promise<PendingSpendsByAccount> {
+  const stored = await chrome.storage.local.get(PENDING_SPENDS_KEY)
+  return (stored[PENDING_SPENDS_KEY] as PendingSpendsByAccount) ?? {}
+}
+
+async function writeAllPendingSpends(all: PendingSpendsByAccount): Promise<void> {
+  await chrome.storage.local.set({ [PENDING_SPENDS_KEY]: all })
+}
+
+export async function getPendingSpends(account: string): Promise<PendingSpend[]> {
+  const all = await readAllPendingSpends()
+  return all[account] ?? []
+}
+
+export async function savePendingSpend(
+  account: string,
+  pending: PendingSpend
+): Promise<void> {
+  const all = await readAllPendingSpends()
+  const existing = (all[account] ?? []).filter(
+    (p) => p.settleCommitmentHex !== pending.settleCommitmentHex
+  )
+  all[account] = [...existing, pending]
+  await writeAllPendingSpends(all)
+}
+
+export async function removePendingSpend(
+  account: string,
+  settleCommitmentHex: string
+): Promise<void> {
+  const all = await readAllPendingSpends()
+  const existing = all[account] ?? []
+  const next = existing.filter((p) => p.settleCommitmentHex !== settleCommitmentHex)
+  if (next.length !== existing.length) {
+    all[account] = next
+    await writeAllPendingSpends(all)
+  }
+}
+
+export async function finalizePendingSpend(
+  account: string,
+  settleCommitmentHex: string
+): Promise<boolean> {
+  const all = await readAllPendingSpends()
+  const existing = all[account] ?? []
+  const target = existing.find((p) => p.settleCommitmentHex === settleCommitmentHex)
+  if (!target) return false
+  for (const input of target.inputs) {
+    await markNoteSpentByIdentity(account, input)
+  }
+  if (target.changeNote) {
+    await addNote(account, target.changeNote)
+  }
+  await removePendingSpend(account, settleCommitmentHex)
+  return true
+}
+
+// Reconcile pending spends against the authoritative on-chain leaf set.
+// - If `settleCommitmentHex` is present in `onchainCommitments`, the spend
+//   settled on-chain (regardless of how long ago it was submitted): mark its
+//   inputs spent, book its change note (preserving `changeBlind`), and remove
+//   the pending entry.
+// - If `settleCommitmentHex` is NOT on-chain and the entry is older than
+//   `PENDING_SPEND_EXPIRY_MS`, the spend never landed: drop the expired pending
+//   entry and leave the input notes unspent so they remain spendable (#792).
+export async function reconcilePendingSpends(
+  account: string,
+  onchainCommitments: Set<string>,
+  now = Date.now()
+): Promise<number> {
+  const pendingList = await getPendingSpends(account)
+  if (pendingList.length === 0) return 0
+
+  let reconciled = 0
+  const remaining: PendingSpend[] = []
+
+  for (const pending of pendingList) {
+    if (onchainCommitments.has(pending.settleCommitmentHex)) {
+      for (const input of pending.inputs) {
+        await markNoteSpentByIdentity(account, input)
+      }
+      if (pending.changeNote) {
+        await addNote(account, pending.changeNote)
+      }
+      reconciled++
+    } else if (now - pending.createdAt <= PENDING_SPEND_EXPIRY_MS) {
+      remaining.push(pending)
+    }
+  }
+
+  if (remaining.length !== pendingList.length) {
+    const all = await readAllPendingSpends()
+    all[account] = remaining
+    await writeAllPendingSpends(all)
+  }
+
+  return reconciled
+}
+
