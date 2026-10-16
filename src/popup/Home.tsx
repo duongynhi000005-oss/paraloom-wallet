@@ -497,8 +497,11 @@ export function Home({ onLock }: HomeProps) {
     // Circuit v3 (#350): spend 1 or 2 notes; change comes back as a new note
     // (audit #16), so partial amounts work from a single note.
     const unspent = notes
-      .filter((n) => !n.spent)
-      .sort((a, b) => Number(BigInt(b.amount) - BigInt(a.amount)))
+      .filter((n) => !n.spent && BigInt(n.amount) > 0n)
+      .sort((a, b) => {
+        const d = BigInt(b.amount) - BigInt(a.amount)
+        return d > 0n ? 1 : d < 0n ? -1 : 0
+      })
     const inputs: ShieldedNote[] = []
     let covered = 0n
     for (const n of unspent) {
@@ -1819,21 +1822,26 @@ export function Home({ onLock }: HomeProps) {
                   onChange={(e) => setTransferAmount(e.target.value)}
                 />
                 <div className="balance-info">
-                  Spends your 2 largest notes; the remainder returns as change. Shielded total:{" "}
+                  Spends up to 2 notes; the remainder returns as change. Shielded total:{" "}
                   {(Number(shieldedLamports) / 1e9).toFixed(4)} SOL across{" "}
-                  {notes.filter((n) => !n.spent).length} note(s)
+                  {notes.filter((n) => !n.spent && BigInt(n.amount) > 0n).length} note(s)
                 </div>
               </div>
 
               <button
                 className="button send-button"
-                disabled={transferring || !transferAddress.trim() || !transferAmount.trim() || notes.filter((n) => !n.spent).length < 2}
+                disabled={
+                  transferring ||
+                  !transferAddress.trim() ||
+                  !transferAmount.trim() ||
+                  notes.filter((n) => !n.spent && BigInt(n.amount) > 0n).length < 1
+                }
                 onClick={handleTransfer}
               >
                 {transferring ? "Proving & sending…" : "Send shielded transfer"}
               </button>
-              {notes.filter((n) => !n.spent).length < 2 && (
-                <div className="balance-info">Needs at least 2 unspent notes (deposit again to split).</div>
+              {notes.filter((n) => !n.spent && BigInt(n.amount) > 0n).length < 1 && (
+                <div className="balance-info">No spendable shielded notes — deposit first.</div>
               )}
             </div>
           </div>

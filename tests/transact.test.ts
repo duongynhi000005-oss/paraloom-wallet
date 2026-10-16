@@ -13,11 +13,28 @@ import {
   TRANSACT_EVENT_DISCRIMINATOR
 } from "~lib/paraloom/constants"
 import { fetchV3Leaves } from "~lib/paraloom/transact"
+import {
+  ensureLeafIndex,
+  resolveVerifiedLeafIndex,
+  spendV3
+} from "~lib/paraloom/transactFlow"
 import { describe, expect, it, vi } from "vitest"
 
 // transact.ts now reaches ~lib/prover through bridge.ts, and the wasm module
-// cannot load under vitest. Nothing in fetchV3Leaves uses it.
-vi.mock("~lib/prover", () => ({ NATIVE_ASSET_HEX: "00".repeat(32) }))
+// cannot load under vitest.
+vi.mock("~lib/prover", () => ({
+  NATIVE_ASSET_HEX: "00".repeat(32),
+  v3NotePubkey: vi.fn(async () => "11".repeat(32)),
+  v3NoteCommitment: vi.fn(async (_amount: bigint, _pub: string, blinding: string) => blinding),
+  v3NoteCommitmentAsset: vi.fn(
+    async (_amount: bigint, _pub: string, blinding: string) => blinding
+  ),
+  v3MerklePath: vi.fn(async (leaves: string[], idx: number) => ({
+    path: Array(20).fill("00".repeat(32)),
+    root: leaves[idx] ?? "00".repeat(32)
+  })),
+  proveTransact: vi.fn()
+}))
 
 const OTHER_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
@@ -361,5 +378,105 @@ describe("refusing an unsafe tree", () => {
       { logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)), nullFor: Infinity }
     ])
     await expect(fetchV3Leaves(connection)).rejects.toThrow(/leaf history may be incomplete/)
+  })
+})
+
+describe("leaf index verification & spendV3 input guards", () => {
+  const c0 = "a0".repeat(32)
+  const c1 = "a1".repeat(32)
+  const c2 = "a2".repeat(32)
+  const leaves = [{ commitmentHex: c0 }, { commitmentHex: c1 }, { commitmentHex: c2 }]
+
+  it("uses note.leafIndex when it matches the commitment at that index", () => {
+    expect(resolveVerifiedLeafIndex({ leafIndex: 1 }, c1, leaves)).toBe(1)
+  })
+
+  it("relocates a note when its cached leafIndex points to a different commitment", () => {
+    // If a note has a stale/misattributed leafIndex (e.g. multi-instruction deposit
+    // log or re-indexed tree), trusting `note.leafIndex` blindly builds a Merkle path
+    // for another leaf and fails circuit synthesis.
+    expect(resolveVerifiedLeafIndex({ leafIndex: 0 }, c2, leaves)).toBe(2)
+  })
+
+  it("rejects a pre-reset note whose cached leafIndex is in-bounds but commitment is absent", () => {
+    // After reset_v3_tree, index 0 exists in the new tree with a different commitment.
+    expect(() => resolveVerifiedLeafIndex({ leafIndex: 0 }, "ff".repeat(32), leaves)).toThrow(
+      /note commitment not found in the on-chain tree/
+    )
+  })
+
+  it("ensureLeafIndex verifies against cachedLeaves even when note.leafIndex is set", async () => {
+    const { connection } = fakeConnection([])
+    const note = {
+      id: "n1",
+      amount: "1000000",
+      blinding: c2, // mocked v3NoteCommitment returns blinding as commitmentHex
+      assetId: "00".repeat(32),
+      signature: "sig",
+      createdAt: 1,
+      spent: false,
+      source: "deposit" as const,
+      leafIndex: 0 // stale index pointing at c0 instead of c2
+    }
+    const resolved = await ensureLeafIndex(connection, note, "22".repeat(32), leaves)
+    expect(resolved).toBe(2)
+  })
+
+  it("spendV3 rejects non-positive input note amounts", async () => {
+    const { connection } = fakeConnection([])
+    const zeroNote = {
+      id: "n0",
+      amount: "0",
+      blinding: c0,
+      assetId: "00".repeat(32),
+      signature: "sig",
+      createdAt: 1,
+      spent: false,
+      source: "transfer" as const,
+      leafIndex: 0
+    }
+    await expect(
+      spendV3(connection, "paraloom1addr", "22".repeat(32), "33".repeat(32), [zeroNote], 100n, {
+        kind: "withdraw",
+        recipientSolanaHex: "44".repeat(32)
+      })
+    ).rejects.toThrow(/input notes must have positive amount/)
+  })
+
+  it("spendV3 rejects duplicate input notes that resolve to the same leafIndex", async () => {
+    const { connection } = fakeConnection([
+      { logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)) },
+      { logs: emittedBy(PROGRAM_ID, depositEvent(0xa1, 1)) }
+    ])
+    const noteA = {
+      id: "n1",
+      amount: "1000000",
+      blinding: c1,
+      assetId: "00".repeat(32),
+      signature: "sig1",
+      createdAt: 1,
+      spent: false,
+      source: "deposit" as const,
+      leafIndex: 1
+    }
+    const noteB = {
+      ...noteA,
+      id: "n2",
+      leafIndex: undefined // resolves to leafIndex 1 as well
+    }
+    await expect(
+      spendV3(
+        connection,
+        "paraloom1addr",
+        "22".repeat(32),
+        "33".repeat(32),
+        [noteA, noteB],
+        1000000n,
+        {
+          kind: "withdraw",
+          recipientSolanaHex: "44".repeat(32)
+        }
+      )
+    ).rejects.toThrow(/duplicate input note leaf index/)
   })
 })

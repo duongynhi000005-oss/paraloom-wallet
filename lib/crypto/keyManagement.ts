@@ -100,10 +100,56 @@ export function generateSeedPhrase(): string {
 }
 
 /**
+ * Canonicalize a BIP39 mnemonic string (NFKD, lowercase, single ASCII spaces)
+ * so multi-line `<textarea>` imports, trailing whitespace, or auto-capitalized
+ * words validate and derive identically to canonical single-space phrases.
+ */
+export function normalizeSeedPhrase(seedPhrase: string): string {
+  if (typeof seedPhrase !== "string") return ""
+  return seedPhrase
+    .normalize("NFKD")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+}
+
+/**
+ * Pick `count` distinct decoy words that do not equal `correctWord`,
+ * deduplicating `allWords` so a mnemonic with repeated BIP39 words (~3.17% of
+ * 12-word phrases) never produces duplicate quiz choices or React keys, and
+ * backfilling from the BIP39 English wordlist when `allWords` has fewer than
+ * `count` unique alternatives.
+ */
+export function pickDecoys(
+  correctWord: string,
+  allWords: string[],
+  count: number
+): string[] {
+  const uniqueOthers = Array.from(new Set(allWords.filter((w) => w !== correctWord)))
+  for (let i = uniqueOthers.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[uniqueOthers[i], uniqueOthers[j]] = [uniqueOthers[j], uniqueOthers[i]]
+  }
+  const chosen = uniqueOthers.slice(0, count)
+  if (chosen.length < count) {
+    const seen = new Set<string>([correctWord, ...chosen])
+    const wordlist = bip39.wordlists.english
+    for (const w of wordlist) {
+      if (!seen.has(w)) {
+        chosen.push(w)
+        seen.add(w)
+        if (chosen.length >= count) break
+      }
+    }
+  }
+  return chosen
+}
+
+/**
  * Validate seed phrase
  */
 export function validateSeedPhrase(seedPhrase: string): boolean {
-  return bip39.validateMnemonic(seedPhrase)
+  return bip39.validateMnemonic(normalizeSeedPhrase(seedPhrase))
 }
 
 /**
@@ -128,12 +174,13 @@ export async function deriveKeypairFromSeed(
   seedPhrase: string,
   accountIndex: number = 0
 ): Promise<WalletKeyPair> {
-  if (!validateSeedPhrase(seedPhrase)) {
+  const normalized = normalizeSeedPhrase(seedPhrase)
+  if (!validateSeedPhrase(normalized)) {
     throw new Error("Invalid seed phrase")
   }
 
   // Convert seed to bytes
-  const seed = bip39.mnemonicToSeedSync(seedPhrase)
+  const seed = bip39.mnemonicToSeedSync(normalized)
 
   // Derive account-specific seed by hashing with account index
   const accountIndexBytes = new Uint8Array(4)

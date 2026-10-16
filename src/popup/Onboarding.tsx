@@ -3,6 +3,8 @@ import {
   deriveKeypairFromSeed,
   encryptWallet,
   generateSeedPhrase,
+  normalizeSeedPhrase,
+  pickDecoys,
   validateSeedPhrase
 } from "~lib/crypto/keyManagement"
 import { saveEncryptedWallet, setLockState } from "~lib/storage/secure"
@@ -22,16 +24,6 @@ function pickRandom(count: number, max: number): number[] {
     [indices[i], indices[j]] = [indices[j], indices[i]]
   }
   return indices.slice(0, count).sort((a, b) => a - b)
-}
-
-// Pick N decoy words that are NOT in the correct answers
-function pickDecoys(correctWord: string, allWords: string[], count: number): string[] {
-  const others = allWords.filter(w => w !== correctWord)
-  for (let i = others.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [others[i], others[j]] = [others[j], others[i]]
-  }
-  return others.slice(0, count)
 }
 
 export function Onboarding({ onComplete }: OnboardingProps) {
@@ -127,7 +119,8 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       return
     }
 
-    if (!validateSeedPhrase(seed)) {
+    const normalizedSeed = normalizeSeedPhrase(seed)
+    if (!validateSeedPhrase(normalizedSeed)) {
       setError("Invalid seed phrase")
       return
     }
@@ -135,7 +128,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
     setLoading(true)
 
     try {
-      const keypair = await deriveKeypairFromSeed(seed, 0)
+      const keypair = await deriveKeypairFromSeed(normalizedSeed, 0)
 
       const initialAccount: Account = {
         index: 0,
@@ -148,13 +141,13 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       await saveEncryptedWallet(
         encrypted,
         keypair.shieldedAddress,
-        seed,
+        normalizedSeed,
         password,
         [initialAccount]
       )
 
-      unlock(keypair, seed)
-      setSeedPhraseStore(seed)
+      unlock(keypair, normalizedSeed)
+      setSeedPhraseStore(normalizedSeed)
       addAccount(initialAccount)
       await setLockState(false)
 

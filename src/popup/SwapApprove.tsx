@@ -1,5 +1,6 @@
 import { useState } from "react"
 import logoImg from "data-base64:~/../assets/icon.png"
+import { DEFAULT_SWAP_SLIPPAGE_BPS, formatSwapAmount } from "~lib/paraloom/swapReconcileClassify"
 
 interface SwapParams {
   outputMint: string
@@ -36,15 +37,6 @@ function inputInfo(inputMint?: string): { decimals: number; symbol: string } {
   if (!inputMint || inputMint === "SOL") return { decimals: 9, symbol: "SOL" }
   if (inputMint === USDC_MINT) return { decimals: 6, symbol: "USDC" }
   return { decimals: 0, symbol: tokenLabel(inputMint) }
-}
-
-function formatAmount(amount: string, decimals: number): string {
-  try {
-    const n = decimals === 0 ? Number(BigInt(amount)) : Number(BigInt(amount)) / 10 ** decimals
-    return n.toLocaleString(undefined, { maximumFractionDigits: 6 })
-  } catch {
-    return amount
-  }
 }
 
 export function SwapApprove({ id, origin, params, onResolved }: SwapApproveProps) {
@@ -98,11 +90,12 @@ export function SwapApprove({ id, origin, params, onResolved }: SwapApproveProps
       <p className="connect-desc">
         This spends{" "}
         <strong>
-          {formatAmount(params.amountLamports, inputInfo(params.inputMint).decimals)}{" "}
+          {formatSwapAmount(params.amountLamports, inputInfo(params.inputMint).decimals)}{" "}
           {inputInfo(params.inputMint).symbol}
         </strong>{" "}
         from your shielded balance, exits to a fresh unlinkable address, and swaps
-        to <strong>{tokenLabel(params.outputMint)}</strong> there.{" "}
+        to <strong>{tokenLabel(params.outputMint)}</strong> there (max slippage{" "}
+        <strong>{((params.slippageBps ?? DEFAULT_SWAP_SLIPPAGE_BPS) / 100).toFixed(2)}%</strong>).{" "}
         {params.reshield
           ? "The result is re-shielded back into your Paraloom balance."
           : "The result stays at that address (it is not re-shielded)."}{" "}

@@ -20,6 +20,7 @@ import {
 } from "~lib/paraloom/privateSwap"
 import { persistReshieldedNote, recoverReshields } from "~lib/paraloom/reshieldRecovery"
 import { reconcileSwapOutputs } from "~lib/paraloom/swapReconcile"
+import { validateSwapRequestParams } from "~lib/paraloom/swapReconcileClassify"
 import { assetIdForMint, NATIVE_ASSET_HEX } from "~lib/prover"
 
 // Private swaps are mainnet-only (Jupiter liquidity) and rebuilding the v3 tree
@@ -766,22 +767,31 @@ async function runSwapJob(
       await setSwapJob({ status: "error", error: "unknown origin" })
       return
     }
-    if (
-      !params ||
-      typeof params.outputMint !== "string" ||
-      typeof params.amountLamports !== "string"
-    ) {
-      await setSwapJob({ status: "error", error: "invalid params" })
+    let validated: ReturnType<typeof validateSwapRequestParams>
+    try {
+      validated = validateSwapRequestParams(params)
+    } catch (err) {
+      await setSwapJob({
+        status: "error",
+        error: err instanceof Error ? err.message : "invalid params"
+      })
       return
     }
-    const decision = requestSwapApproval(origin, params, 180_000)
+    const normalizedParams: SwapRequestParams = {
+      outputMint: validated.outputMint,
+      inputMint: validated.inputMint,
+      amountLamports: validated.amountLamports,
+      slippageBps: validated.slippageBps,
+      reshield: validated.reshield
+    }
+    const decision = requestSwapApproval(origin, normalizedParams, 180_000)
     await openWalletWindow()
     const approved = await decision
     if (!approved) {
       await setSwapJob({ status: "error", error: "rejected" })
       return
     }
-    const result = await handlePrivateSwap(params)
+    const result = await handlePrivateSwap(normalizedParams)
     await setSwapJob({ status: "done", result: result.data })
   } catch (e) {
     await setSwapJob({
@@ -844,8 +854,8 @@ async function handlePrivateSwap(
   const session = await loadSession()
   if (!session) throw new Error("wallet is locked")
 
-  const amount = BigInt(params.amountLamports)
-  if (amount <= 0n) throw new Error("amount must be > 0")
+  const validated = validateSwapRequestParams(params)
+  const amount = validated.amount
 
   const shieldedAddress = session.wallet.shieldedAddress
   const spendPrivkeyHex = Buffer.from(session.wallet.spendPrivkey).toString("hex")
@@ -864,9 +874,9 @@ async function handlePrivateSwap(
 
   // Token-input swap (e.g. USDC -> SOL): spend a shielded SPL note and self-fund
   // gas from the user's own shielded SOL (Plan A′, full privacy).
-  if (params.inputMint && params.inputMint !== "SOL") {
+  if (validated.inputMint && validated.inputMint !== "SOL") {
     const inputAssetId = await assetIdForMint(
-      new PublicKey(params.inputMint).toBuffer().toString("hex")
+      new PublicKey(validated.inputMint).toBuffer().toString("hex")
     )
     const allNotes = await getNotes(shieldedAddress)
     const tokenCandidates = allNotes.filter(
@@ -898,11 +908,11 @@ async function handlePrivateSwap(
       tokenInputs,
       gasInputs,
       {
-        inputMint: params.inputMint,
+        inputMint: validated.inputMint,
         amountTokenUnits: amount,
-        outputMint: params.outputMint,
-        slippageBps: params.slippageBps ?? 100,
-        reshield: params.reshield ?? true
+        outputMint: validated.outputMint,
+        slippageBps: validated.slippageBps,
+        reshield: validated.reshield ?? true
       },
       undefined,
       (note) => persistReshieldedNote(shieldedAddress, note)
@@ -937,10 +947,10 @@ async function handlePrivateSwap(
     ownBoxPubHex,
     inputs,
     {
-      outputMint: params.outputMint,
+      outputMint: validated.outputMint,
       amountLamports: amount,
-      slippageBps: params.slippageBps ?? 100,
-      reshield: params.reshield ?? false
+      slippageBps: validated.slippageBps,
+      reshield: validated.reshield ?? false
     },
     undefined,
     // Persist the re-shielded note the instant its deposit is submitted, so a
@@ -972,11 +982,12 @@ async function handlePrivateSwap(
   }
 }
 
-// Pick up to two unspent native notes covering `amount` (spendV3 spends 1–2 and
-// returns change). Largest-first keeps the note count minimal.
+// Pick up to two unspent positive-value notes covering `amount` (spendV3 spends
+// 1–2 and returns change). Largest-first keeps the note count minimal.
 function selectNotes(notes: ShieldedNote[], amount: bigint): ShieldedNote[] {
-  if (notes.length === 0) throw new Error("no shielded notes to spend")
-  const sorted = [...notes].sort((a, b) => {
+  const positive = notes.filter((n) => BigInt(n.amount) > 0n)
+  if (positive.length === 0) throw new Error("no shielded notes to spend")
+  const sorted = [...positive].sort((a, b) => {
     const d = BigInt(b.amount) - BigInt(a.amount)
     return d > 0n ? 1 : d < 0n ? -1 : 0
   })

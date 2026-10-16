@@ -134,9 +134,33 @@ export async function depositV3(
   return { signature, leafIndex }
 }
 
+/// Verify a note's cached `leafIndex` against the rebuilt on-chain leaf list,
+/// falling back to a commitment search if the cached index is absent, out of
+/// range, or points to a different commitment (e.g. after a tree reset or a
+/// multi-instruction deposit log).
+export function resolveVerifiedLeafIndex(
+  note: Pick<ShieldedNote, "leafIndex">,
+  commitmentHex: string,
+  leaves: { commitmentHex: string }[]
+): number {
+  if (
+    note.leafIndex !== undefined &&
+    Number.isInteger(note.leafIndex) &&
+    note.leafIndex >= 0 &&
+    note.leafIndex < leaves.length &&
+    leaves[note.leafIndex].commitmentHex === commitmentHex
+  ) {
+    return note.leafIndex
+  }
+  const idx = leaves.findIndex((l) => l.commitmentHex === commitmentHex)
+  if (idx < 0) throw new Error("note commitment not found in the on-chain tree")
+  return idx
+}
+
 /// Locate a note's leaf index by its commitment (for received notes that were
-/// scanned from ciphertexts and carry no index).
-async function ensureLeafIndex(
+/// scanned from ciphertexts and carry no index, or deposit notes whose cached
+/// index needs verification against the current tree epoch).
+export async function ensureLeafIndex(
   connection: Connection,
   note: ShieldedNote,
   spendPrivkeyHex: string,
@@ -144,9 +168,9 @@ async function ensureLeafIndex(
   // spendV3 doesn't page the whole chain history again per input note. Only ever
   // pass leaves fetched in the same spend — never a stale snapshot from a prior
   // settlement, whose root may no longer be known on-chain.
-  cachedLeaves?: { commitmentHex: string }[]
+  cachedLeaves?: { commitmentHex: string }[],
+  shieldedAddress?: string
 ): Promise<number> {
-  if (note.leafIndex !== undefined && note.leafIndex >= 0) return note.leafIndex
   const pubkeyHex = await v3NotePubkey(spendPrivkeyHex)
   // Compute the commitment under the note's own asset (#779): a shielded SPL
   // note's leaf binds its mint-derived assetId, not the native all-zero one, so
@@ -156,8 +180,10 @@ async function ensureLeafIndex(
       ? await v3NoteCommitmentAsset(BigInt(note.amount), pubkeyHex, note.blinding, note.assetId)
       : await v3NoteCommitment(BigInt(note.amount), pubkeyHex, note.blinding)
   const leaves = cachedLeaves ?? (await fetchV3Leaves(connection))
-  const idx = leaves.findIndex((l) => l.commitmentHex === commitment)
-  if (idx < 0) throw new Error("note commitment not found in the on-chain tree")
+  const idx = resolveVerifiedLeafIndex(note, commitment, leaves)
+  if (shieldedAddress && note.leafIndex !== idx) {
+    await setNoteLeafIndex(shieldedAddress, commitment, idx).catch(() => {})
+  }
   return idx
 }
 
@@ -202,6 +228,9 @@ export async function spendV3(
   if (inputs.length < 1 || inputs.length > 2) {
     throw new Error("transact spends 1 or 2 notes")
   }
+  if (inputs.some((n) => BigInt(n.amount) <= 0n)) {
+    throw new Error("input notes must have positive amount")
+  }
   const sumIn = inputs.reduce((acc, n) => acc + BigInt(n.amount), 0n)
   if (payLamports <= 0n || payLamports > sumIn) {
     throw new Error("amount exceeds the selected notes")
@@ -240,7 +269,13 @@ export async function spendV3(
   for (const note of inputs) {
     // Reuse the leaves rebuilt just above (same snapshot) instead of paging the
     // whole chain history again per input note.
-    const leafIndex = await ensureLeafIndex(connection, note, spendPrivkeyHex, leaves)
+    const leafIndex = await ensureLeafIndex(
+      connection,
+      note,
+      spendPrivkeyHex,
+      leaves,
+      shieldedAddress
+    )
     const { path, root } = await v3MerklePath(leavesHex, leafIndex)
     rootHex = root
     inputSpecs.push({
@@ -250,6 +285,9 @@ export async function spendV3(
       leafIndex,
       pathHex: path
     })
+  }
+  if (inputSpecs.length === 2 && inputSpecs[0].leafIndex === inputSpecs[1].leafIndex) {
+    throw new Error("duplicate input note leaf index")
   }
   // Pad a single-note spend with a zero-value dummy (membership is skipped
   // in-circuit for zero notes; the path just needs the right shape).
