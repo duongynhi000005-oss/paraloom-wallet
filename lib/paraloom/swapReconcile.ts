@@ -45,7 +45,7 @@ export async function reconcileSwapOutputs(
   reconcileInFlight = true
   let resolved = 0
   try {
-    const outputs = await listSwapOutputs()
+    const outputs = await listSwapOutputs(shieldedAddress)
     const now = Date.now()
     for (const o of outputs) {
       if (o.swapSignature) continue
@@ -59,8 +59,14 @@ export async function reconcileSwapOutputs(
         continue // RPC blip: retry on the next open rather than guess
       }
 
+      const isTokenInputSwap =
+        !!o.inputMint && !isNativeSolOutput(o.inputMint)
+
       let tokenAmount = 0n
-      if (solLamports <= RESUME_MIN_LAMPORTS && !isNativeSolOutput(o.outputMint)) {
+      if (
+        (solLamports <= RESUME_MIN_LAMPORTS || isTokenInputSwap) &&
+        !isNativeSolOutput(o.outputMint)
+      ) {
         try {
           const accts = await connection.getParsedTokenAccountsByOwner(freshPub, {
             mint: new PublicKey(o.outputMint)
@@ -82,7 +88,7 @@ export async function reconcileSwapOutputs(
       let action = classifyStrand({
         hasSignature: false,
         ageMs: now - o.createdAt,
-        solLamports,
+        solLamports: isTokenInputSwap && !isNativeSolOutput(o.outputMint) ? 0n : solLamports,
         tokenAmount
       })
 
@@ -107,8 +113,10 @@ export async function reconcileSwapOutputs(
           )
           await saveSwapOutput({
             ...o,
+            shieldedAddress: o.shieldedAddress ?? shieldedAddress,
             outAmount: r.outAmount,
-            swapSignature: r.swapSignature
+            swapSignature: r.swapSignature,
+            ...(r.reshielded ? { reshieldRecovered: true } : {})
           })
           if (r.reshielded) {
             await persistReshieldedNote(shieldedAddress, r.reshielded)
@@ -128,11 +136,12 @@ export async function reconcileSwapOutputs(
           // resolves and links to the explorer. No re-shield here: the fresh
           // address has no gas SOL left to pay for it, and the token stays
           // recoverable at the address the wallet still holds the key for.
-          const sigs = await connection.getSignaturesForAddress(freshPub, { limit: 1 })
-          const sig = sigs[0]?.signature
+          const sigs = await connection.getSignaturesForAddress(freshPub, { limit: 10 })
+          const sig = sigs.find((s) => !s.err)?.signature
           if (!sig) continue // cannot attest it landed → leave for manual dismiss
           await saveSwapOutput({
             ...o,
+            shieldedAddress: o.shieldedAddress ?? shieldedAddress,
             outAmount: Number(tokenAmount),
             swapSignature: sig
           })

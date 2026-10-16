@@ -12,7 +12,10 @@ import {
   recoverReshieldedNote
 } from "~lib/paraloom/bridge"
 import { addNote } from "~lib/paraloom/notes"
-import type { ReshieldedNote } from "~lib/paraloom/privateSwap"
+import {
+  isNativeSolOutput,
+  type ReshieldedNote
+} from "~lib/paraloom/privateSwap"
 import { listSwapOutputs, saveSwapOutput } from "~lib/paraloom/swapOutputs"
 import { assetIdForMint } from "~lib/prover"
 
@@ -47,9 +50,9 @@ export async function recoverReshields(
   shieldedAddress: string
 ): Promise<number> {
   let recovered = 0
-  const outputs = await listSwapOutputs()
+  const outputs = await listSwapOutputs(shieldedAddress)
   for (const o of outputs) {
-    if (!o.reshield || !o.swapSignature || o.outputMint === "SOL") continue
+    if (!o.reshield || !o.swapSignature || isNativeSolOutput(o.outputMint)) continue
     if (o.reshieldRecovered) continue
     try {
       const mint = new PublicKey(o.outputMint)

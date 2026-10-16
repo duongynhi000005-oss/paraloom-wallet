@@ -14,6 +14,7 @@ import {
 import { fetchV3Leaves } from "~lib/paraloom/transact"
 import {
   GAS_LAMPORTS,
+  isNativeSolOutput,
   privateSwap,
   privateSwapFromToken,
   type ReshieldedNote
@@ -864,22 +865,21 @@ async function handlePrivateSwap(
 
   // Token-input swap (e.g. USDC -> SOL): spend a shielded SPL note and self-fund
   // gas from the user's own shielded SOL (Plan A′, full privacy).
-  if (params.inputMint && params.inputMint !== "SOL") {
+  if (params.inputMint && !isNativeSolOutput(params.inputMint)) {
     const inputAssetId = await assetIdForMint(
       new PublicKey(params.inputMint).toBuffer().toString("hex")
     )
-    const allNotes = await getNotes(shieldedAddress)
-    const tokenCandidates = allNotes.filter(
-      (n) => !n.spent && n.assetId === inputAssetId
-    )
-    const tokenInputs = selectNotes(tokenCandidates, amount)
-    const nativeCandidates = allNotes.filter(
-      (n) => !n.spent && n.assetId === NATIVE_ASSET_HEX
-    )
-    const gasNotes = await dropPhantomNotes(
+    const unspentNotes = await dropPhantomNotes(
       connection,
       shieldedAddress,
-      nativeCandidates
+      (await getNotes(shieldedAddress)).filter((n) => !n.spent)
+    )
+    const tokenCandidates = unspentNotes.filter(
+      (n) => n.assetId === inputAssetId
+    )
+    const tokenInputs = selectNotes(tokenCandidates, amount)
+    const gasNotes = unspentNotes.filter(
+      (n) => !n.assetId || n.assetId === NATIVE_ASSET_HEX
     )
     let gasInputs: ShieldedNote[]
     try {
@@ -917,13 +917,15 @@ async function handlePrivateSwap(
         freshAddress: tokenResult.freshAddress,
         swapSignature: tokenResult.swapSignature,
         outAmount: tokenResult.outAmount,
-        reshielded: tokenResult.reshielded !== undefined
+        reshielded:
+          tokenResult.reshielded !== undefined ||
+          ((params.reshield ?? true) && isNativeSolOutput(params.outputMint))
       }
     }
   }
 
   const candidates = (await getNotes(shieldedAddress)).filter(
-    (n) => !n.spent && n.assetId === NATIVE_ASSET_HEX
+    (n) => !n.spent && (!n.assetId || n.assetId === NATIVE_ASSET_HEX)
   )
   // Reconcile out phantom notes (leftovers from swaps that never settled)
   // before selecting, so a stale note can't brick the spend.

@@ -171,8 +171,8 @@ export function Home({ onLock }: HomeProps) {
   // Load the private-swap outputs (tokens bought at fresh unlinkable addresses);
   // refresh when the Activity tab is opened.
   useEffect(() => {
-    listSwapOutputs().then(setSwapOutputs).catch(() => {})
-  }, [bottomTab])
+    listSwapOutputs(wallet?.shieldedAddress).then(setSwapOutputs).catch(() => {})
+  }, [bottomTab, wallet?.shieldedAddress])
 
   // Refresh the connected-sites list whenever the Settings tab is opened.
   useEffect(() => {
@@ -305,31 +305,31 @@ export function Home({ onLock }: HomeProps) {
     } catch {
       // transfer node down / no scan endpoint — ignore
     }
+    // Resolve stranded swap rows first so any newly-landed swap gets its
+    // swapSignature filled in before recoverReshields runs. Private swaps are
+    // mainnet-only, so both reconcileSwapOutputs and recoverReshields always
+    // run against the mainnet archival RPC regardless of the selected network.
+    const mainnetConn = getConnection("mainnet-beta")
+    try {
+      const resolved = await reconcileSwapOutputs(
+        mainnetConn,
+        wallet.shieldedAddress
+      )
+      if (resolved > 0) {
+        listSwapOutputs(wallet.shieldedAddress).then(setSwapOutputs).catch(() => {})
+      }
+    } catch {
+      // best-effort
+    }
     // Recover any re-shield whose deposit landed on-chain but whose note was
     // never persisted (or whose deposit never ran but the token is still at the
     // fresh address). Runs directly in the popup — no service-worker relay — so
     // it always fires when the wallet is opened, and the reads below then reflect
     // the recovered shielded balance.
     try {
-      await recoverReshields(getConnection(network), wallet.shieldedAddress)
+      await recoverReshields(mainnetConn, wallet.shieldedAddress)
     } catch {
       // best-effort — the reads below still show whatever is already local
-    }
-    // Resolve stranded swap rows so Activity stops showing settled swaps as
-    // "Pending" forever. Private swaps are mainnet-only, so this always runs
-    // against the mainnet archival RPC regardless of the selected network. It
-    // finishes a swap whose leg never ran and records one that already landed;
-    // rows it cannot account for are left for the user to dismiss.
-    try {
-      const resolved = await reconcileSwapOutputs(
-        getConnection("mainnet-beta"),
-        wallet.shieldedAddress
-      )
-      if (resolved > 0) {
-        listSwapOutputs().then(setSwapOutputs).catch(() => {})
-      }
-    } catch {
-      // best-effort
     }
     try {
       setShieldedLamports(await shieldedBalance(wallet.shieldedAddress))
@@ -497,8 +497,17 @@ export function Home({ onLock }: HomeProps) {
     // Circuit v3 (#350): spend 1 or 2 notes; change comes back as a new note
     // (audit #16), so partial amounts work from a single note.
     const unspent = notes
-      .filter((n) => !n.spent)
-      .sort((a, b) => Number(BigInt(b.amount) - BigInt(a.amount)))
+      .filter(
+        (n) =>
+          !n.spent &&
+          (!n.assetId || n.assetId === NATIVE_ASSET_HEX) &&
+          !n.mint &&
+          BigInt(n.amount) > 0n
+      )
+      .sort((a, b) => {
+        const d = BigInt(b.amount) - BigInt(a.amount)
+        return d > 0n ? 1 : d < 0n ? -1 : 0
+      })
     const inputs: ShieldedNote[] = []
     let covered = 0n
     for (const n of unspent) {

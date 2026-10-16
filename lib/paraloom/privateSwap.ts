@@ -316,6 +316,8 @@ export async function privateSwap(
     freshAddress: fresh.publicKey.toBase58(),
     freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
     outputMint: params.outputMint,
+    inputMint: "SOL",
+    shieldedAddress,
     outAmount: 0,
     swapSignature: "",
     reshield: params.reshield ?? false,
@@ -389,8 +391,11 @@ export async function privateSwap(
     freshAddress: fresh.publicKey.toBase58(),
     freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
     outputMint: params.outputMint,
+    inputMint: "SOL",
+    shieldedAddress,
     outAmount: out_amount,
     swapSignature,
+    reshield: params.reshield ?? false,
     createdAt: Date.now()
   })
 
@@ -413,6 +418,20 @@ export async function privateSwap(
       params.outputMint,
       onReshielded
     )
+    if (reshielded) {
+      await saveSwapOutput({
+        freshAddress: fresh.publicKey.toBase58(),
+        freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
+        outputMint: params.outputMint,
+        inputMint: "SOL",
+        shieldedAddress,
+        outAmount: out_amount,
+        swapSignature,
+        reshield: true,
+        reshieldRecovered: true,
+        createdAt: Date.now()
+      })
+    }
   }
 
   return {
@@ -505,6 +524,8 @@ export async function privateSwapFromToken(
     freshAddress: fresh.publicKey.toBase58(),
     freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
     outputMint: params.outputMint,
+    inputMint: params.inputMint,
+    shieldedAddress,
     outAmount: 0,
     swapSignature: "",
     reshield: params.reshield ?? false,
@@ -595,8 +616,11 @@ export async function privateSwapFromToken(
     freshAddress: fresh.publicKey.toBase58(),
     freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
     outputMint: params.outputMint,
+    inputMint: params.inputMint,
+    shieldedAddress,
     outAmount: out_amount,
     swapSignature,
+    reshield: params.reshield ?? false,
     createdAt: Date.now()
   })
   await waitForSwapConfirmation(connection, swapSignature)
@@ -618,6 +642,18 @@ export async function privateSwapFromToken(
           spendPrivkeyHex,
           reshieldLamports
         )
+        await saveSwapOutput({
+          freshAddress: fresh.publicKey.toBase58(),
+          freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
+          outputMint: params.outputMint,
+          inputMint: params.inputMint,
+          shieldedAddress,
+          outAmount: out_amount,
+          swapSignature,
+          reshield: true,
+          reshieldRecovered: true,
+          createdAt: Date.now()
+        })
       }
     } catch {
       // leave the swapped SOL as a private buy at the fresh address
@@ -630,6 +666,20 @@ export async function privateSwapFromToken(
       params.outputMint,
       onReshielded
     )
+    if (reshielded) {
+      await saveSwapOutput({
+        freshAddress: fresh.publicKey.toBase58(),
+        freshSecretKeyHex: Buffer.from(fresh.secretKey).toString("hex"),
+        outputMint: params.outputMint,
+        inputMint: params.inputMint,
+        shieldedAddress,
+        outAmount: out_amount,
+        swapSignature,
+        reshield: true,
+        reshieldRecovered: true,
+        createdAt: Date.now()
+      })
+    }
   }
 
   return {
@@ -684,7 +734,7 @@ export async function resumeSwapAtFreshAddress(
   )
 
   let reshielded: ReshieldedNote | undefined
-  if (reshield && outputMint !== "SOL") {
+  if (reshield && !isNativeSolOutput(outputMint)) {
     reshielded = await reshieldToken(
       connection,
       fresh,
