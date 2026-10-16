@@ -418,8 +418,9 @@ export function solanaAddress(publicKey: Uint8Array): string {
 const B58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-function base58Decode(s: string): Uint8Array {
-  const bytes: number[] = [0]
+export function base58Decode(s: string): Uint8Array {
+  if (s.length === 0) return new Uint8Array(0)
+  const bytes: number[] = []
   for (const ch of s) {
     const v = B58_ALPHABET.indexOf(ch)
     if (v < 0) throw new Error(`invalid base58 char: ${ch}`)
@@ -462,18 +463,40 @@ export async function recoverReshieldedNote(
     const msg = tx.transaction.message as unknown as {
       staticAccountKeys?: PublicKey[]
       accountKeys?: PublicKey[]
-      compiledInstructions?: { programIdIndex: number; data: Uint8Array }[]
-      instructions?: { programIdIndex: number; data: string }[]
+      compiledInstructions?: { programIdIndex: number; data: Uint8Array | string }[]
+      instructions?: { programIdIndex: number; data: string | Uint8Array }[]
     }
-    const keys = msg.staticAccountKeys ?? msg.accountKeys ?? []
-    const ixs = msg.compiledInstructions ?? msg.instructions ?? []
-    for (const ix of ixs) {
+    const loadedWritable = tx.meta?.loadedAddresses?.writable ?? []
+    const loadedReadonly = tx.meta?.loadedAddresses?.readonly ?? []
+    const keys = [
+      ...(msg.staticAccountKeys ?? msg.accountKeys ?? []),
+      ...loadedWritable,
+      ...loadedReadonly
+    ]
+    const topIxs = msg.compiledInstructions ?? msg.instructions ?? []
+    const innerIxs = (tx.meta?.innerInstructions ?? []).flatMap(
+      (inner) =>
+        (inner.instructions as {
+          programIdIndex: number
+          data: string | Uint8Array
+        }[]) ?? []
+    )
+    for (const ix of [...topIxs, ...innerIxs]) {
       const prog = keys[ix.programIdIndex]
       if (!prog || prog.toBase58() !== programId.toBase58()) continue
-      const data =
-        typeof (ix as { data: unknown }).data === "string"
-          ? base58Decode((ix as { data: string }).data)
-          : Uint8Array.from((ix as { data: Uint8Array }).data)
+      const rawData = (ix as { data: unknown }).data
+      let data: Uint8Array
+      if (typeof rawData === "string") {
+        try {
+          data = base58Decode(rawData)
+        } catch {
+          continue
+        }
+      } else if (rawData instanceof Uint8Array || Array.isArray(rawData)) {
+        data = Uint8Array.from(rawData)
+      } else {
+        continue
+      }
       if (data.length < 80 || !bytesStartWith(data, DEPOSIT_NOTE_SPL_DISCRIMINATOR)) {
         continue
       }

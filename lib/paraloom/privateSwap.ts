@@ -100,17 +100,23 @@ export interface PrivateSwapResult {
 // Unlike connection.confirmTransaction (hard 30s deadline), this tolerates a
 // busy mainnet: it only rejects on a real on-chain error or if the tx never
 // confirms within the window.
-async function waitForSwapConfirmation(
-  connection: Connection,
+export async function waitForSwapConfirmation(
+  connection: Pick<Connection, "getSignatureStatus">,
   signature: string,
-  timeoutMs = 90_000
+  timeoutMs = 90_000,
+  pollMs = 2_000
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const st = await connection.getSignatureStatus(signature, {
-      searchTransactionHistory: true
-    })
-    const v = st.value
+    let v: Awaited<ReturnType<Connection["getSignatureStatus"]>>["value"] = null
+    try {
+      const st = await connection.getSignatureStatus(signature, {
+        searchTransactionHistory: true
+      })
+      v = st.value
+    } catch {
+      // Transient RPC error — keep polling until deadline.
+    }
     if (v) {
       if (v.err) {
         throw new Error(`swap transaction failed on-chain: ${JSON.stringify(v.err)}`)
@@ -119,7 +125,7 @@ async function waitForSwapConfirmation(
         return
       }
     }
-    await new Promise((r) => setTimeout(r, 2000))
+    await new Promise((r) => setTimeout(r, pollMs))
   }
   throw new Error(
     `swap submitted (${signature}) but not confirmed within ${timeoutMs / 1000}s — check the explorer`
@@ -269,15 +275,21 @@ async function reshieldToken(
   }
 }
 
-async function waitForFunding(
-  connection: Connection,
-  pubkey: Keypair["publicKey"]
+export async function waitForFunding(
+  connection: Pick<Connection, "getBalance">,
+  pubkey: Keypair["publicKey"],
+  timeoutMs = SETTLE_TIMEOUT_MS,
+  pollMs = SETTLE_POLL_MS
 ): Promise<bigint> {
-  const deadline = Date.now() + SETTLE_TIMEOUT_MS
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, SETTLE_POLL_MS))
-    const bal = BigInt(await connection.getBalance(pubkey))
-    if (bal > 0n) return bal
+    await new Promise((r) => setTimeout(r, pollMs))
+    try {
+      const bal = BigInt(await connection.getBalance(pubkey))
+      if (bal > 0n) return bal
+    } catch {
+      // Transient RPC error while polling fresh address balance — keep polling until deadline.
+    }
   }
   throw new Error(
     "withdraw is still settling and has not funded the fresh address yet. Do NOT retry — the spent note is already committed and the funds will arrive at the saved address; reopen the wallet to let the swap resume once it lands."

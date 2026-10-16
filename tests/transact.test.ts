@@ -92,6 +92,7 @@ interface FakeTx {
   err?: unknown
   /** Number of leading getTransaction calls that return null. */
   nullFor?: number
+  slot?: number
 }
 
 function fakeConnection(txs: FakeTx[]) {
@@ -105,10 +106,14 @@ function fakeConnection(txs: FakeTx[]) {
     async getSignaturesForAddress(_addr: unknown, opts: { limit: number; before?: string }) {
       calls.signatures.push(opts.before)
       const start = opts.before ? order.indexOf(opts.before) + 1 : 0
-      return order.slice(start, start + opts.limit).map((signature) => ({
-        signature,
-        err: txs[Number(signature.slice(3))].err ?? null
-      }))
+      return order.slice(start, start + opts.limit).map((signature) => {
+        const tx = txs[Number(signature.slice(3))]
+        return {
+          signature,
+          err: tx.err ?? null,
+          ...(tx.slot !== undefined ? { slot: tx.slot } : {})
+        }
+      })
     },
     async getTransaction(signature: string) {
       calls.getTransaction++
@@ -361,5 +366,51 @@ describe("refusing an unsafe tree", () => {
       { logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)), nullFor: Infinity }
     ])
     await expect(fetchV3Leaves(connection)).rejects.toThrow(/leaf history may be incomplete/)
+  })
+
+  it("correctly numbers intra-slot TransactEvent and DepositNoteEvent regardless of intra-slot signature order", async () => {
+    // Case 1: DepositNoteEvent(leafIndex=2) is visited before TransactEvent(indices 0,1) in the same slot.
+    const { connection: conn1 } = fakeConnection([
+      { slot: 100, logs: emittedBy(PROGRAM_ID, depositEvent(0xa2, 2)) },
+      { slot: 100, logs: emittedBy(PROGRAM_ID, transactEvent(0xb0, 0xb1)) }
+    ])
+    const leaves1 = await fetchV3Leaves(conn1)
+    expect(leaves1.map((l) => [l.index, l.commitmentHex.slice(0, 2)])).toEqual([
+      [0, "b0"],
+      [1, "b1"],
+      [2, "a2"]
+    ])
+
+    // Case 2: TransactEvent(indices 1,2) is visited before DepositNoteEvent(leafIndex=0) in the same slot.
+    const { connection: conn2 } = fakeConnection([
+      { slot: 200, logs: emittedBy(PROGRAM_ID, transactEvent(0xb1, 0xb2)) },
+      { slot: 200, logs: emittedBy(PROGRAM_ID, depositEvent(0xa0, 0)) }
+    ])
+    const leaves2 = await fetchV3Leaves(conn2)
+    expect(leaves2.map((l) => [l.index, l.commitmentHex.slice(0, 2)])).toEqual([
+      [0, "a0"],
+      [1, "b1"],
+      [2, "b2"]
+    ])
+  })
+
+  it("rejects truncated DepositNoteEvent, DepositNoteSplEvent, and TransactEvent payloads", async () => {
+    const shortDeposit = payload(DEPOSIT_NOTE_EVENT_DISCRIMINATOR, new Uint8Array(79))
+    const { connection: c1 } = fakeConnection([
+      { logs: emittedBy(PROGRAM_ID, shortDeposit) }
+    ])
+    await expect(fetchV3Leaves(c1)).rejects.toThrow(/Malformed DepositNoteEvent payload/)
+
+    const shortSpl = payload(DEPOSIT_NOTE_SPL_EVENT_DISCRIMINATOR, new Uint8Array(111))
+    const { connection: c2 } = fakeConnection([
+      { logs: emittedBy(PROGRAM_ID, shortSpl) }
+    ])
+    await expect(fetchV3Leaves(c2)).rejects.toThrow(/Malformed DepositNoteSplEvent payload/)
+
+    const shortTransact = payload(TRANSACT_EVENT_DISCRIMINATOR, new Uint8Array(127))
+    const { connection: c3 } = fakeConnection([
+      { logs: emittedBy(PROGRAM_ID, shortTransact) }
+    ])
+    await expect(fetchV3Leaves(c3)).rejects.toThrow(/Malformed TransactEvent payload/)
   })
 })

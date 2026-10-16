@@ -25,16 +25,34 @@ const RES = "paraloom:response"
 
 let counter = 0
 
-function relay(type: string, payload?: Record<string, unknown>): Promise<any> {
+const DEFAULT_RELAY_TIMEOUT_MS = 240_000
+const FAST_RELAY_TIMEOUT_MS = 30_000
+
+function relay(
+  type: string,
+  payload?: Record<string, unknown>,
+  timeoutMs = DEFAULT_RELAY_TIMEOUT_MS
+): Promise<any> {
   return new Promise((resolve, reject) => {
     const id = ++counter
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      window.removeEventListener("message", onMessage)
+      if (timer !== undefined) clearTimeout(timer)
+    }
     const onMessage = (event: MessageEvent) => {
       if (event.source !== window) return
       const data = event.data
       if (!data || data.channel !== RES || data.id !== id) return
-      window.removeEventListener("message", onMessage)
+      cleanup()
       if (data.error) reject(new Error(data.error))
       else resolve(data.result)
+    }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        cleanup()
+        reject(new Error(`Wallet request timed out (${type})`))
+      }, timeoutMs)
     }
     window.addEventListener("message", onMessage)
     window.postMessage({ channel: REQ, id, type, payload }, window.location.origin)
@@ -54,11 +72,11 @@ if (!(window as any).paraloom) {
       // popup for a new origin), then poll isConnected() — which reflects the
       // DURABLE approval recorded when the user approves. The first poll also
       // covers the already-approved fast path (returns immediately, no popup).
-      void relay("CONNECT_WALLET").catch(() => {})
+      void relay("CONNECT_WALLET", undefined, FAST_RELAY_TIMEOUT_MS).catch(() => {})
       for (let i = 0; i < 180; i++) {
-        const c = await relay("IS_CONNECTED").catch(() => null)
+        const c = await relay("IS_CONNECTED", undefined, FAST_RELAY_TIMEOUT_MS).catch(() => null)
         if (c?.connected) {
-          const a = await relay("GET_ADDRESS").catch(() => null)
+          const a = await relay("GET_ADDRESS", undefined, FAST_RELAY_TIMEOUT_MS).catch(() => null)
           if (a?.address) return { address: a.address, publicKey: a.address }
         }
         await new Promise((res) => setTimeout(res, 700))
@@ -66,7 +84,7 @@ if (!(window as any).paraloom) {
       throw new Error("Connection request timed out")
     },
     disconnect: async () => {
-      await relay("DISCONNECT_WALLET")
+      await relay("DISCONNECT_WALLET", undefined, FAST_RELAY_TIMEOUT_MS)
     },
     signMessage: async (message: string) => {
       const r = await relay("SIGN_MESSAGE", { message })
@@ -93,13 +111,24 @@ if (!(window as any).paraloom) {
       // The polling keeps the MV3 worker alive through the approval + the
       // ~2-3 min swap; a single held response could not (worker eviction dropped
       // it as "message channel closed").
-      const ack = await relay("PRIVATE_SWAP", { params }).catch(() => null)
-      if (ack && ack.success === false) {
-        throw new Error(ack.error || "Private swap failed")
+      const ack = await relay("PRIVATE_SWAP", { params }, FAST_RELAY_TIMEOUT_MS)
+      if (!ack || ack.success !== true) {
+        throw new Error(ack?.error || "Private swap failed")
       }
+      const expectedStartedAt =
+        typeof ack.startedAt === "number" ? ack.startedAt : undefined
       for (let i = 0; i < 200; i++) {
         await new Promise((res) => setTimeout(res, 1500))
-        const st = await relay("GET_SWAP_STATUS").catch(() => null)
+        const st = await relay("GET_SWAP_STATUS", undefined, FAST_RELAY_TIMEOUT_MS).catch(
+          () => null
+        )
+        if (
+          expectedStartedAt !== undefined &&
+          typeof st?.startedAt === "number" &&
+          st.startedAt !== expectedStartedAt
+        ) {
+          continue
+        }
         if (st?.status === "done") return st.result
         if (st?.status === "error") {
           throw new Error(st.error || "Private swap failed")

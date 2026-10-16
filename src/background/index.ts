@@ -382,11 +382,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // response can't (the setInterval keep-alive is unreliable in a service
     // worker, so the worker was evicted mid-swap: "message channel closed").
     isAuthorizedSender(sender)
-      .then((ok) => {
+      .then(async (ok) => {
         if (!ok) return sendResponse({ success: false, error: "not authorized" })
-        void setSwapJob({ status: "pending", startedAt: Date.now() })
-        void runSwapJob(message.params, sender)
-        sendResponse({ success: true, pending: true })
+        if (await swapInFlight().catch(() => false)) {
+          return sendResponse({
+            success: false,
+            error: "A private swap is already in progress"
+          })
+        }
+        const startedAt = Date.now()
+        await setSwapJob({ status: "pending", startedAt })
+        void runSwapJob(message.params, sender, startedAt)
+        sendResponse({ success: true, pending: true, startedAt })
       })
       .catch((err) => sendResponse({ success: false, error: err.message }))
     return true
@@ -754,7 +761,8 @@ async function setSwapJob(job: SwapJob): Promise<void> {
 // the ~2-3 min swap.
 async function runSwapJob(
   params: SwapRequestParams,
-  sender: chrome.runtime.MessageSender
+  sender: chrome.runtime.MessageSender,
+  startedAt: number
 ): Promise<void> {
   try {
     // Starting a swap is activity: reset the idle clock so the 15-min auto-lock
@@ -763,7 +771,7 @@ async function runSwapJob(
     void recordActivity(Date.now())
     const origin = senderOrigin(sender)
     if (!origin) {
-      await setSwapJob({ status: "error", error: "unknown origin" })
+      await setSwapJob({ status: "error", error: "unknown origin", startedAt })
       return
     }
     if (
@@ -771,22 +779,23 @@ async function runSwapJob(
       typeof params.outputMint !== "string" ||
       typeof params.amountLamports !== "string"
     ) {
-      await setSwapJob({ status: "error", error: "invalid params" })
+      await setSwapJob({ status: "error", error: "invalid params", startedAt })
       return
     }
     const decision = requestSwapApproval(origin, params, 180_000)
     await openWalletWindow()
     const approved = await decision
     if (!approved) {
-      await setSwapJob({ status: "error", error: "rejected" })
+      await setSwapJob({ status: "error", error: "rejected", startedAt })
       return
     }
     const result = await handlePrivateSwap(params)
-    await setSwapJob({ status: "done", result: result.data })
+    await setSwapJob({ status: "done", result: result.data, startedAt })
   } catch (e) {
     await setSwapJob({
       status: "error",
-      error: e instanceof Error ? e.message : String(e)
+      error: e instanceof Error ? e.message : String(e),
+      startedAt
     })
   }
 }

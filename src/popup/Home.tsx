@@ -449,7 +449,11 @@ export function Home({ onLock }: HomeProps) {
           confirmSettled: async () => {
             for (let i = 0; i < 25; i++) {
               await new Promise((r) => setTimeout(r, 2000))
-              if ((await getSolBalance(conn, targetBytes)) > before) return true
+              try {
+                if ((await getSolBalance(conn, targetBytes)) > before) return true
+              } catch {
+                // Transient RPC error while polling recipient balance — keep polling.
+              }
             }
             return false
           }
