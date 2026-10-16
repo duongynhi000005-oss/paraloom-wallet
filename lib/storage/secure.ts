@@ -25,9 +25,15 @@ export interface WalletStorage {
   locked: boolean
   autoLockMinutes: number
   network?: "mainnet-beta" | "devnet"
+  failedUnlockAttempts?: number
+  unlockLockedUntil?: number
+  unlockLockoutTier?: number
 }
 
 const STORAGE_KEY = "paraloom_wallet"
+export const MAX_UNLOCK_ATTEMPTS = 5
+export const BASE_LOCKOUT_SECONDS = 30
+const MAX_LOCKOUT_SECONDS = 900
 
 export async function saveEncryptedWallet(
   encryptedWallet: EncryptedWallet,
@@ -82,6 +88,16 @@ export async function migrateWalletToScrypt(
   const storage = result[STORAGE_KEY] as WalletStorage | undefined
   if (!storage?.wallet) return
 
+  // Both `encryptedData` and `encryptedSeedPhrase` share the single `kdfVersion`
+  // marker. If the vault has a stored `encryptedSeedPhrase` but the caller did
+  // not supply the plaintext `seedPhrase` to re-encrypt under scrypt, refuse to
+  // bump `kdfVersion` — otherwise `encryptedSeedPhrase` remains encrypted under
+  // the legacy SHA-256 KDF while `kdfVersion` is set to scrypt, permanently
+  // orphaning the user's seed phrase and multi-account derivation.
+  if (storage.wallet.encryptedSeedPhrase && !seedPhrase) {
+    return
+  }
+
   storage.wallet.encryptedData = encryptedWallet
   storage.wallet.kdfVersion = KDF_VERSION_SCRYPT
   if (seedPhrase) {
@@ -89,6 +105,89 @@ export async function migrateWalletToScrypt(
   }
 
   await chrome.storage.local.set({ [STORAGE_KEY]: storage })
+}
+
+export interface UnlockLockoutState {
+  attempts: number
+  lockedUntil: number
+  tier: number
+}
+
+export async function getUnlockLockoutState(): Promise<UnlockLockoutState> {
+  const result = await chrome.storage.local.get(STORAGE_KEY)
+  const storage = result[STORAGE_KEY] as WalletStorage | undefined
+  return {
+    attempts: storage?.failedUnlockAttempts ?? 0,
+    lockedUntil: storage?.unlockLockedUntil ?? 0,
+    tier: storage?.unlockLockoutTier ?? 0
+  }
+}
+
+export async function recordFailedUnlockAttempt(
+  now = Date.now()
+): Promise<{
+  attempts: number
+  lockedUntil: number
+  lockedOut: boolean
+  lockoutSeconds: number
+}> {
+  const result = await chrome.storage.local.get(STORAGE_KEY)
+  const storage = result[STORAGE_KEY] as WalletStorage | undefined
+  if (!storage) {
+    return { attempts: 0, lockedUntil: 0, lockedOut: false, lockoutSeconds: 0 }
+  }
+  const currentLockedUntil = storage.unlockLockedUntil ?? 0
+  if (now < currentLockedUntil) {
+    return {
+      attempts: storage.failedUnlockAttempts ?? 0,
+      lockedUntil: currentLockedUntil,
+      lockedOut: true,
+      lockoutSeconds: Math.ceil((currentLockedUntil - now) / 1000)
+    }
+  }
+  const newAttempts = (storage.failedUnlockAttempts ?? 0) + 1
+  if (newAttempts >= MAX_UNLOCK_ATTEMPTS) {
+    const newTier = (storage.unlockLockoutTier ?? 0) + 1
+    const lockoutSeconds = Math.min(
+      MAX_LOCKOUT_SECONDS,
+      BASE_LOCKOUT_SECONDS * 2 ** (newTier - 1)
+    )
+    const lockedUntil = now + lockoutSeconds * 1000
+    storage.failedUnlockAttempts = 0
+    storage.unlockLockedUntil = lockedUntil
+    storage.unlockLockoutTier = newTier
+    await chrome.storage.local.set({ [STORAGE_KEY]: storage })
+    return {
+      attempts: 0,
+      lockedUntil,
+      lockedOut: true,
+      lockoutSeconds
+    }
+  }
+  storage.failedUnlockAttempts = newAttempts
+  await chrome.storage.local.set({ [STORAGE_KEY]: storage })
+  return {
+    attempts: newAttempts,
+    lockedUntil: 0,
+    lockedOut: false,
+    lockoutSeconds: 0
+  }
+}
+
+export async function clearUnlockLockout(): Promise<void> {
+  const result = await chrome.storage.local.get(STORAGE_KEY)
+  const storage = result[STORAGE_KEY] as WalletStorage | undefined
+  if (!storage) return
+  if (
+    storage.failedUnlockAttempts ||
+    storage.unlockLockedUntil ||
+    storage.unlockLockoutTier
+  ) {
+    storage.failedUnlockAttempts = 0
+    storage.unlockLockedUntil = 0
+    storage.unlockLockoutTier = 0
+    await chrome.storage.local.set({ [STORAGE_KEY]: storage })
+  }
 }
 
 export async function getStoredWallet(): Promise<StoredWallet | null> {

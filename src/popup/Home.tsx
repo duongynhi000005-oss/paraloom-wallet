@@ -1,6 +1,18 @@
 import { useState, useEffect, useRef } from "react"
 import { createPortal } from "react-dom"
-import { setLockState, updateAccounts, clearWallet, getNetwork, setNetwork as saveNetwork, getAutoLockMinutes, setAutoLockMinutes } from "~lib/storage/secure"
+import {
+  setLockState,
+  updateAccounts,
+  clearWallet,
+  getNetwork,
+  setNetwork as saveNetwork,
+  getAutoLockMinutes,
+  setAutoLockMinutes,
+  clearUnlockLockout,
+  getUnlockLockoutState,
+  MAX_UNLOCK_ATTEMPTS,
+  recordFailedUnlockAttempt
+} from "~lib/storage/secure"
 import { clearSession } from "~lib/storage/session"
 import { getApprovedOrigins, removeApprovedOrigin } from "~lib/storage/connections"
 import { useWalletStore } from "~lib/store/walletStore"
@@ -9,6 +21,10 @@ import { getStoredWallet } from "~lib/storage/secure"
 import type { Account } from "~lib/store/walletStore"
 import { getConnection, deposit, getSolBalance, solanaAddress, solanaAddressToBytes } from "~lib/paraloom/bridge"
 import { addNote, getNotes, markNoteSpent, shieldedBalance, shieldedTokenBalances, type ShieldedNote } from "~lib/paraloom/notes"
+import {
+  parseSolInputToLamports,
+  SOL_DEPOSIT_FEE_RESERVE_LAMPORTS
+} from "~lib/paraloom/proverSerialize"
 
 // Known shielded SPL tokens for display; unknown mints fall back to a truncated
 // mint and raw base units.
@@ -366,14 +382,13 @@ export function Home({ onLock }: HomeProps) {
 
   async function handleDeposit() {
     if (!wallet) return
-    const sol = Number(depositAmount)
-    if (!sol || sol <= 0) {
+    const lamports = parseSolInputToLamports(depositAmount)
+    if (!lamports) {
       showToast("Enter a valid amount", "error")
       return
     }
-    const lamports = BigInt(Math.round(sol * 1e9))
-    if (lamports > solBalance) {
-      showToast("Amount exceeds your SOL balance", "error")
+    if (lamports + SOL_DEPOSIT_FEE_RESERVE_LAMPORTS > solBalance) {
+      showToast("Amount exceeds your SOL balance (leaving network fee reserve)", "error")
       return
     }
     setDepositing(true)
@@ -408,12 +423,12 @@ export function Home({ onLock }: HomeProps) {
       showToast("Invalid Solana address", "error")
       return
     }
-    const amt = Number(withdrawAmount)
-    if (!amt || amt <= 0) {
+    const lamports = parseSolInputToLamports(withdrawAmount)
+    if (!lamports) {
       showToast("Enter an amount to withdraw", "error")
       return
     }
-    const lamports = BigInt(Math.round(amt * 1e9))
+    const amt = Number(lamports) / 1e9
     // Pick up to 2 spendable notes covering the amount; the wallet returns the
     // change as a new note, so the user withdraws a chosen amount instead of one
     // whole note. A single withdraw settles at most 2 notes.
@@ -432,11 +447,13 @@ export function Home({ onLock }: HomeProps) {
     try {
       const conn = getConnection(network)
       const before = await getSolBalance(conn, targetBytes)
+      const minExpectedIncrease = lamports / 2n > 0n ? lamports / 2n : 1n
       // Circuit v3 (#350): a withdraw is a transact with ext_amount < 0; the
       // proof binds the destination and the quorum settles it. spendV3 marks the
       // inputs spent and books any change note ONLY once settlement is confirmed
-      // — the recipient balance rising above `before` — so a failed settlement
-      // never hides still-spendable funds (paraloom-core#792).
+      // — the recipient balance rising by at least `minExpectedIncrease` — so a
+      // failed settlement or a 1-lamport dust transfer never hides still-spendable
+      // funds (paraloom-core#792).
       const { requestId, settled } = await spendV3(
         conn,
         wallet.shieldedAddress,
@@ -449,7 +466,12 @@ export function Home({ onLock }: HomeProps) {
           confirmSettled: async () => {
             for (let i = 0; i < 25; i++) {
               await new Promise((r) => setTimeout(r, 2000))
-              if ((await getSolBalance(conn, targetBytes)) > before) return true
+              try {
+                const cur = await getSolBalance(conn, targetBytes)
+                if (cur > before && cur - before >= minExpectedIncrease) return true
+              } catch {
+                // Transient RPC error mid-poll must not abort spendV3 after submission.
+              }
             }
             return false
           }
@@ -487,12 +509,11 @@ export function Home({ onLock }: HomeProps) {
       showToast("Cannot transfer to your own address", "error")
       return
     }
-    const sol = parseFloat(transferAmount)
-    if (!Number.isFinite(sol) || sol <= 0) {
+    const amount = parseSolInputToLamports(transferAmount)
+    if (!amount) {
       showToast("Enter a valid amount", "error")
       return
     }
-    const amount = BigInt(Math.round(sol * 1e9))
 
     // Circuit v3 (#350): spend 1 or 2 notes; change comes back as a new note
     // (audit #16), so partial amounts work from a single note.
@@ -593,11 +614,22 @@ export function Home({ onLock }: HomeProps) {
 
   async function handleExportPK() {
     setSettingsPasswordError("")
+    const lockSt = await getUnlockLockoutState().catch(() => ({
+      attempts: 0,
+      lockedUntil: 0,
+      tier: 0
+    }))
+    if (Date.now() < lockSt.lockedUntil) {
+      const secs = Math.ceil((lockSt.lockedUntil - Date.now()) / 1000)
+      setSettingsPasswordError(`Too many attempts. Try again in ${secs}s`)
+      return
+    }
     try {
       const stored = await getStoredWallet()
       if (!stored) throw new Error("No wallet found")
       const isLegacy = (stored.kdfVersion ?? 0) < KDF_VERSION_SCRYPT
       await decryptWallet(stored.encryptedData, settingsPassword, isLegacy)
+      await clearUnlockLockout()
       // Password correct — show the secret key as hex
       const hexKey = Buffer.from(wallet!.secretKey).toString("hex")
       setRevealedPK(hexKey)
@@ -605,22 +637,64 @@ export function Home({ onLock }: HomeProps) {
       setShowPKModal(false)
       setSettingsPassword("")
     } catch {
-      setSettingsPasswordError("Incorrect password")
+      const res = await recordFailedUnlockAttempt().catch(() => ({
+        attempts: 1,
+        lockedUntil: 0,
+        lockedOut: false,
+        lockoutSeconds: 0
+      }))
+      if (res.lockedOut) {
+        setSettingsPassword("")
+        await handleLock()
+        return
+      }
+      setSettingsPasswordError(
+        `Incorrect password (${MAX_UNLOCK_ATTEMPTS - res.attempts} attempts remaining)`
+      )
     }
   }
 
   async function handleShowSeed() {
     setSettingsPasswordError("")
+    const lockSt = await getUnlockLockoutState().catch(() => ({
+      attempts: 0,
+      lockedUntil: 0,
+      tier: 0
+    }))
+    if (Date.now() < lockSt.lockedUntil) {
+      const secs = Math.ceil((lockSt.lockedUntil - Date.now()) / 1000)
+      setSettingsPasswordError(`Too many attempts. Try again in ${secs}s`)
+      return
+    }
     try {
       const stored = await getStoredWallet()
       if (!stored?.encryptedSeedPhrase) throw new Error("No seed phrase stored")
       const isLegacy = (stored.kdfVersion ?? 0) < KDF_VERSION_SCRYPT
-      const phrase = decryptSeedPhrase(stored.encryptedSeedPhrase, settingsPassword, isLegacy)
+      let phrase: string
+      try {
+        phrase = decryptSeedPhrase(stored.encryptedSeedPhrase, settingsPassword, isLegacy)
+      } catch {
+        phrase = decryptSeedPhrase(stored.encryptedSeedPhrase, settingsPassword, !isLegacy)
+      }
+      await clearUnlockLockout()
       setRevealedSeed(phrase)
       setShowSeedModal(false)
       setSettingsPassword("")
     } catch {
-      setSettingsPasswordError("Incorrect password")
+      const res = await recordFailedUnlockAttempt().catch(() => ({
+        attempts: 1,
+        lockedUntil: 0,
+        lockedOut: false,
+        lockoutSeconds: 0
+      }))
+      if (res.lockedOut) {
+        setSettingsPassword("")
+        await handleLock()
+        return
+      }
+      setSettingsPasswordError(
+        `Incorrect password (${MAX_UNLOCK_ATTEMPTS - res.attempts} attempts remaining)`
+      )
     }
   }
 

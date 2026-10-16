@@ -8,6 +8,7 @@ import { noteCommitmentV2, proveWithdrawalV2 } from "~lib/prover"
 import { INGRESS_URL, PATH_SERVER_URL } from "./constants"
 import { solanaAddressToBytes } from "./bridge"
 import type { ShieldedNote } from "./notes"
+import { serializeWithdrawalBodyJson } from "./proverSerialize"
 
 interface MerklePathResponse {
   root: string
@@ -31,7 +32,13 @@ export async function withdraw(
   toSolanaAddress: string,
   spendPrivkeyHex: string
 ): Promise<WithdrawResult> {
+  if (note.spent) {
+    throw new Error("Cannot withdraw an already-spent note")
+  }
   const amount = BigInt(note.amount)
+  if (amount <= 0n) {
+    throw new Error("Withdrawal amount must be > 0")
+  }
 
   const commitment = await noteCommitmentV2(amount, spendPrivkeyHex, note.blinding, note.assetId)
 
@@ -60,18 +67,18 @@ export async function withdraw(
     indices
   })
 
-  const body = {
+  const bodyJson = serializeWithdrawalBodyJson({
     nullifier,
     recipient: destRecipientHex,
     proof,
-    amount: Number(amount),
-    fee: 0
-  }
+    amount,
+    fee: 0n
+  })
 
   const res = await fetch(`${INGRESS_URL}/withdrawal/submit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: bodyJson
   })
   if (!res.ok) {
     throw new Error(`Ingress rejected the withdrawal (${res.status})`)

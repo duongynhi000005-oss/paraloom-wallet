@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import {
   decryptWallet,
   decryptSeedPhrase,
@@ -7,17 +7,18 @@ import {
   KDF_VERSION_SCRYPT
 } from "~lib/crypto/keyManagement"
 import {
+  clearUnlockLockout,
   getStoredWallet,
+  getUnlockLockoutState,
+  MAX_UNLOCK_ATTEMPTS,
   migrateWalletToScrypt,
+  recordFailedUnlockAttempt,
   setLockState
 } from "~lib/storage/secure"
 import { saveSession } from "~lib/storage/session"
 import { useWalletStore } from "~lib/store/walletStore"
 import type { Account } from "~lib/store/walletStore"
 import logoImg from "data-base64:~/../assets/icon.png"
-
-const MAX_ATTEMPTS = 5
-const LOCKOUT_SECONDS = 30
 
 interface UnlockProps {
   onUnlock: () => void
@@ -29,7 +30,34 @@ export function Unlock({ onUnlock }: UnlockProps) {
   const [loading, setLoading] = useState(false)
   const [attempts, setAttempts] = useState(0)
   const [lockedUntil, setLockedUntil] = useState(0)
-  const { unlock, setSeedPhrase, addAccount } = useWalletStore()
+  const [, setTick] = useState(0)
+  const { unlock, addAccount } = useWalletStore()
+
+  useEffect(() => {
+    getUnlockLockoutState()
+      .then((st) => {
+        setAttempts(st.attempts)
+        setLockedUntil(st.lockedUntil)
+        if (st.lockedUntil > Date.now()) {
+          const secs = Math.ceil((st.lockedUntil - Date.now()) / 1000)
+          setError(`Too many attempts. Try again in ${secs}s`)
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (lockedUntil <= Date.now()) return
+    const timer = setInterval(() => {
+      if (Date.now() >= lockedUntil) {
+        setLockedUntil(0)
+        setError("")
+      } else {
+        setTick((t) => t + 1)
+      }
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [lockedUntil])
 
   const isLockedOut = Date.now() < lockedUntil
   const remainingSeconds = isLockedOut
@@ -37,7 +65,17 @@ export function Unlock({ onUnlock }: UnlockProps) {
     : 0
 
   async function handleUnlock() {
-    if (isLockedOut) return
+    const preLock = await getUnlockLockoutState().catch(() => ({
+      attempts,
+      lockedUntil,
+      tier: 0
+    }))
+    if (Date.now() < preLock.lockedUntil) {
+      setLockedUntil(preLock.lockedUntil)
+      const secs = Math.ceil((preLock.lockedUntil - Date.now()) / 1000)
+      setError(`Too many attempts. Try again in ${secs}s`)
+      return
+    }
     setError("")
     setLoading(true)
 
@@ -58,12 +96,17 @@ export function Unlock({ onUnlock }: UnlockProps) {
       if (stored.encryptedSeedPhrase) {
         try {
           seedPhrase = decryptSeedPhrase(stored.encryptedSeedPhrase, password, isLegacy)
-        } catch {}
+        } catch {
+          try {
+            seedPhrase = decryptSeedPhrase(stored.encryptedSeedPhrase, password, !isLegacy)
+          } catch {}
+        }
       }
 
       // Transparently upgrade legacy vaults to scrypt now that the password
-      // is confirmed correct. Best-effort: a failure here doesn't block unlock.
-      if (isLegacy) {
+      // is confirmed correct, but only when any stored encryptedSeedPhrase was
+      // also decrypted so both blobs stay under the same KDF version.
+      if (isLegacy && (!stored.encryptedSeedPhrase || !!seedPhrase)) {
         try {
           const upgraded = encryptWallet(wallet, password)
           await migrateWalletToScrypt(upgraded, seedPhrase, password)
@@ -85,7 +128,9 @@ export function Unlock({ onUnlock }: UnlockProps) {
 
       unlock(wallet, seedPhrase)
       await setLockState(false)
+      await clearUnlockLockout()
       setAttempts(0)
+      setLockedUntil(0)
 
       // Persist the decrypted session in memory-only storage so reopening the
       // popup doesn't force a re-unlock (the idle auto-lock timer still applies).
@@ -100,20 +145,21 @@ export function Unlock({ onUnlock }: UnlockProps) {
       chrome.runtime.sendMessage({ type: "ACTIVITY" })
       onUnlock()
     } catch {
-      const newAttempts = attempts + 1
-      setAttempts(newAttempts)
+      const res = await recordFailedUnlockAttempt().catch(() => ({
+        attempts: attempts + 1,
+        lockedUntil: 0,
+        lockedOut: false,
+        lockoutSeconds: 0
+      }))
+      setAttempts(res.attempts)
 
-      if (newAttempts >= MAX_ATTEMPTS) {
-        setLockedUntil(Date.now() + LOCKOUT_SECONDS * 1000)
-        setError(`Too many attempts. Try again in ${LOCKOUT_SECONDS}s`)
-        setAttempts(0)
-
-        setTimeout(() => {
-          setLockedUntil(0)
-          setError("")
-        }, LOCKOUT_SECONDS * 1000)
+      if (res.lockedOut) {
+        setLockedUntil(res.lockedUntil)
+        setError(`Too many attempts. Try again in ${res.lockoutSeconds}s`)
       } else {
-        setError(`Invalid password (${MAX_ATTEMPTS - newAttempts} attempts remaining)`)
+        setError(
+          `Invalid password (${MAX_UNLOCK_ATTEMPTS - res.attempts} attempts remaining)`
+        )
       }
 
       setPassword("")

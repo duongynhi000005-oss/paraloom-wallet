@@ -19,6 +19,13 @@ import keyUrl from "url:./withdraw_v2_proving.key"
 import transferKeyUrl from "url:./transfer_v2_proving.key"
 import transactKeyUrl from "url:./transact_v3_proving.key"
 
+import {
+  serializeTransactInputsJson,
+  serializeTransactOutputsJson,
+  serializeTransferInputsJson,
+  serializeTransferOutputsJson
+} from "~lib/paraloom/proverSerialize"
+
 // Native-SOL asset id (#235): all-zero 32 bytes, hex. SPL assets use the mint.
 export const NATIVE_ASSET_HEX = "00".repeat(32)
 
@@ -32,43 +39,97 @@ export async function assetIdForMint(mintHex: string): Promise<string> {
 }
 
 let initialized = false
+let initPromise: Promise<void> | null = null
 let provingKey: Uint8Array | null = null
+let provingKeyPromise: Promise<Uint8Array> | null = null
 let transferProvingKey: Uint8Array | null = null
+let transferProvingKeyPromise: Promise<Uint8Array> | null = null
 
 async function ensureInit(): Promise<void> {
-  if (!initialized) {
-    await init(wasmUrl)
-    initialized = true
+  if (initialized) return
+  if (!initPromise) {
+    initPromise = (async () => {
+      try {
+        await init(wasmUrl)
+        initialized = true
+      } finally {
+        if (!initialized) initPromise = null
+      }
+    })()
   }
+  await initPromise
+}
+
+async function fetchProvingKeyBytes(url: string, label: string): Promise<Uint8Array> {
+  const res = await fetch(url)
+  if (typeof res.ok === "boolean" && !res.ok) {
+    throw new Error(`failed to load ${label} (${res.status})`)
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer())
+  if (bytes.byteLength === 0) {
+    throw new Error(`${label} is empty`)
+  }
+  return bytes
 }
 
 async function ensureReady(): Promise<Uint8Array> {
   await ensureInit()
-  if (!provingKey) {
-    const res = await fetch(keyUrl)
-    provingKey = new Uint8Array(await res.arrayBuffer())
+  if (provingKey) return provingKey
+  if (!provingKeyPromise) {
+    provingKeyPromise = fetchProvingKeyBytes(keyUrl, "withdraw_v2_proving.key")
+      .then((bytes) => {
+        provingKey = bytes
+        return bytes
+      })
+      .catch((err) => {
+        provingKeyPromise = null
+        throw err
+      })
   }
-  return provingKey
+  return provingKeyPromise
 }
 
 async function ensureTransferReady(): Promise<Uint8Array> {
   await ensureInit()
-  if (!transferProvingKey) {
-    const res = await fetch(transferKeyUrl)
-    transferProvingKey = new Uint8Array(await res.arrayBuffer())
+  if (transferProvingKey) return transferProvingKey
+  if (!transferProvingKeyPromise) {
+    transferProvingKeyPromise = fetchProvingKeyBytes(
+      transferKeyUrl,
+      "transfer_v2_proving.key"
+    )
+      .then((bytes) => {
+        transferProvingKey = bytes
+        return bytes
+      })
+      .catch((err) => {
+        transferProvingKeyPromise = null
+        throw err
+      })
   }
-  return transferProvingKey
+  return transferProvingKeyPromise
 }
 
 let transactProvingKey: Uint8Array | null = null
+let transactProvingKeyPromise: Promise<Uint8Array> | null = null
 
 async function ensureTransactReady(): Promise<Uint8Array> {
   await ensureInit()
-  if (!transactProvingKey) {
-    const res = await fetch(transactKeyUrl)
-    transactProvingKey = new Uint8Array(await res.arrayBuffer())
+  if (transactProvingKey) return transactProvingKey
+  if (!transactProvingKeyPromise) {
+    transactProvingKeyPromise = fetchProvingKeyBytes(
+      transactKeyUrl,
+      "transact_v3_proving.key"
+    )
+      .then((bytes) => {
+        transactProvingKey = bytes
+        return bytes
+      })
+      .catch((err) => {
+        transactProvingKeyPromise = null
+        throw err
+      })
   }
-  return transactProvingKey
+  return transactProvingKeyPromise
 }
 
 // Derive the spend public key (`Poseidon(privkey)`) bound into note commitments;
@@ -126,7 +187,7 @@ export async function proveWithdrawalV2(input: WithdrawalProofInput): Promise<Wi
 
 // One spent input note + its Merkle path (mirrors core's `TransferInputV2`).
 export interface TransferProofInputNote {
-  amount: number // lamports (JSON number; serde u64)
+  amount: bigint | number // lamports (serialized as exact u64 JSON token)
   blinding_hex: string
   privkey_hex: string
   path_hex: string[]
@@ -136,7 +197,7 @@ export interface TransferProofInputNote {
 // One created output note (mirrors core's `TransferOutputV2`). `pubkey_hex` is
 // the recipient's spend public key, so only they can later spend the note.
 export interface TransferProofOutputNote {
-  amount: number
+  amount: bigint | number
   blinding_hex: string
   pubkey_hex: string
 }
@@ -160,8 +221,8 @@ export async function proveTransferV2(
     key,
     root,
     assetIdHex,
-    JSON.stringify(inputs),
-    JSON.stringify(outputs)
+    serializeTransferInputsJson(inputs),
+    serializeTransferOutputsJson(outputs)
   )
   return JSON.parse(json) as TransferProof
 }
@@ -236,22 +297,8 @@ export async function proveTransact(
   outputs: [TransactProofOutput, TransactProofOutput]
 ): Promise<string> {
   const pk = await ensureTransactReady()
-  const inputsJson = JSON.stringify(
-    inputs.map((i) => ({
-      amount: Number(i.amount),
-      privkey_hex: i.privkeyHex,
-      blinding_hex: i.blindingHex,
-      leaf_index: i.leafIndex,
-      path_hex: i.pathHex
-    }))
-  )
-  const outputsJson = JSON.stringify(
-    outputs.map((o) => ({
-      amount: Number(o.amount),
-      pubkey_hex: o.pubkeyHex,
-      blinding_hex: o.blindingHex
-    }))
-  )
+  const inputsJson = serializeTransactInputsJson(inputs)
+  const outputsJson = serializeTransactOutputsJson(outputs)
   return prove_transact(
     pk,
     rootHex,
