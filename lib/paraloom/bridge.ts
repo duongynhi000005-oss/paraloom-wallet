@@ -418,8 +418,9 @@ export function solanaAddress(publicKey: Uint8Array): string {
 const B58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-function base58Decode(s: string): Uint8Array {
-  const bytes: number[] = [0]
+export function base58Decode(s: string): Uint8Array {
+  if (s.length === 0) return new Uint8Array(0)
+  const bytes: number[] = []
   for (const ch of s) {
     const v = B58_ALPHABET.indexOf(ch)
     if (v < 0) throw new Error(`invalid base58 char: ${ch}`)
@@ -445,14 +446,27 @@ function bytesStartWith(a: Uint8Array, prefix: Uint8Array): boolean {
   return true
 }
 
+export interface RecoverReshieldOptions {
+  /** Expected SPL mint (base58) at DepositNoteSpl account index 2. */
+  expectedMint?: string
+  /** Expected 32-byte recipient spendPub (64 lowercase hex chars) at data[16..48]. */
+  expectedSpendPubHex?: string
+}
+
 /** Recover the re-shield note (amount + blinding) from the fresh address's
  *  on-chain `deposit_note_spl` transaction, or null if none is found. Layout:
  *  disc(8) | amount u64 LE (8) | pubkey(32) | blinding(32). */
 export async function recoverReshieldedNote(
   connection: Connection,
-  freshAddress: string
+  freshAddress: string,
+  opts?: RecoverReshieldOptions
 ): Promise<{ amount: string; blindingHex: string; signature: string } | null> {
   const pk = new PublicKey(freshAddress)
+  const expectedDepositor = pk.toBase58()
+  const expectedMint = opts?.expectedMint
+    ? new PublicKey(opts.expectedMint).toBase58()
+    : undefined
+  const expectedSpendPub = opts?.expectedSpendPubHex?.toLowerCase()
   const sigs = await connection.getSignaturesForAddress(pk, { limit: 12 })
   for (const s of sigs) {
     const tx = await connection.getTransaction(s.signature, {
@@ -460,25 +474,60 @@ export async function recoverReshieldedNote(
     })
     if (!tx || tx.meta?.err) continue
     const msg = tx.transaction.message as unknown as {
+      header?: { numRequiredSignatures?: number }
       staticAccountKeys?: PublicKey[]
       accountKeys?: PublicKey[]
-      compiledInstructions?: { programIdIndex: number; data: Uint8Array }[]
-      instructions?: { programIdIndex: number; data: string }[]
+      compiledInstructions?: {
+        programIdIndex: number
+        accountKeyIndexes?: number[]
+        data: Uint8Array
+      }[]
+      instructions?: {
+        programIdIndex: number
+        accounts?: number[]
+        data: string
+      }[]
     }
     const keys = msg.staticAccountKeys ?? msg.accountKeys ?? []
     const ixs = msg.compiledInstructions ?? msg.instructions ?? []
     for (const ix of ixs) {
       const prog = keys[ix.programIdIndex]
       if (!prog || prog.toBase58() !== programId.toBase58()) continue
+      // Verify DepositNoteSpl account bindings:
+      // [0] bridge_state, [1] asset_config, [2] mint, [3] asset_vault,
+      // [4] depositor_token_account, [5] merkle_tree, [6] depositor (signer), [7] token_program.
+      const acctIdxs =
+        (ix as { accountKeyIndexes?: number[] }).accountKeyIndexes ??
+        (ix as { accounts?: number[] }).accounts
+      if (!Array.isArray(acctIdxs) || acctIdxs.length < 8) continue
+      const depositorIdx = acctIdxs[6]
+      const depositorKey = keys[depositorIdx]
+      if (!depositorKey || depositorKey.toBase58() !== expectedDepositor) continue
+      if (
+        typeof msg.header?.numRequiredSignatures === "number" &&
+        depositorIdx >= msg.header.numRequiredSignatures
+      ) {
+        continue
+      }
+      if (expectedMint !== undefined) {
+        const mintKey = keys[acctIdxs[2]]
+        if (!mintKey || mintKey.toBase58() !== expectedMint) continue
+      }
       const data =
         typeof (ix as { data: unknown }).data === "string"
           ? base58Decode((ix as { data: string }).data)
           : Uint8Array.from((ix as { data: Uint8Array }).data)
-      if (data.length < 80 || !bytesStartWith(data, DEPOSIT_NOTE_SPL_DISCRIMINATOR)) {
+      if (data.length !== 80 || !bytesStartWith(data, DEPOSIT_NOTE_SPL_DISCRIMINATOR)) {
         continue
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
       const amount = dv.getBigUint64(8, true)
+      if (amount <= 0n) continue
+      const pubkey = data.slice(16, 48)
+      const pubkeyHex = Buffer.from(pubkey).toString("hex").toLowerCase()
+      if (expectedSpendPub !== undefined && pubkeyHex !== expectedSpendPub) {
+        continue
+      }
       const blinding = data.slice(48, 80)
       return {
         amount: amount.toString(),

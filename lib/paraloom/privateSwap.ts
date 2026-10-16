@@ -32,8 +32,18 @@ import type { ShieldedNote } from "./notes"
 import { saveSwapOutput } from "./swapOutputs"
 import { depositV3, spendV3 } from "./transactFlow"
 
-import { WSOL_MINT, isNativeSolOutput } from "./swapReconcileClassify"
-export { WSOL_MINT, isNativeSolOutput }
+import {
+  isNativeSolOutput,
+  validateAndDeserializeSwapTransaction,
+  validateSwapRouteResponse,
+  WSOL_MINT
+} from "./swapReconcileClassify"
+export {
+  isNativeSolOutput,
+  validateAndDeserializeSwapTransaction,
+  validateSwapRouteResponse,
+  WSOL_MINT
+}
 
 /** Lamports left at the fresh address to cover the swap's own costs: the output
  *  token ATA rent (~0.00204), the fresh account's rent-exempt floor (~0.00089),
@@ -173,10 +183,7 @@ async function routeSwap(
           `swap routing failed (${res.status}): ${await res.text()}`
         )
       } else {
-        return (await res.json()) as {
-          out_amount: number
-          swap_transaction: string
-        }
+        return validateSwapRouteResponse(await res.json())
       }
     } catch (e) {
       lastErr = e
@@ -201,8 +208,9 @@ async function executeSwapLeg(
     outputMint,
     swapLamports
   )
-  const tx = VersionedTransaction.deserialize(
-    Uint8Array.from(Buffer.from(swap_transaction, "base64"))
+  const tx = validateAndDeserializeSwapTransaction(
+    swap_transaction,
+    fresh.publicKey
   )
   tx.sign([fresh])
   const swapSignature = await connection.sendRawTransaction(tx.serialize(), {
@@ -371,9 +379,10 @@ export async function privateSwap(
     swapLamports
   )
 
-  // 6. Sign the swap with the fresh key locally and submit it.
-  const tx = VersionedTransaction.deserialize(
-    Uint8Array.from(Buffer.from(swap_transaction, "base64"))
+  // 6. Verify and sign the swap with the fresh key locally, then submit it.
+  const tx = validateAndDeserializeSwapTransaction(
+    swap_transaction,
+    fresh.publicKey
   )
   tx.sign([fresh])
   const swapSignature = await connection.sendRawTransaction(tx.serialize(), {
@@ -583,8 +592,9 @@ export async function privateSwapFromToken(
     tokenLanded,
     params.inputMint
   )
-  const tx = VersionedTransaction.deserialize(
-    Uint8Array.from(Buffer.from(swap_transaction, "base64"))
+  const tx = validateAndDeserializeSwapTransaction(
+    swap_transaction,
+    fresh.publicKey
   )
   tx.sign([fresh])
   const swapSignature = await connection.sendRawTransaction(tx.serialize(), {

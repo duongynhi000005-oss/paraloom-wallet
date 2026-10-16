@@ -382,11 +382,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // response can't (the setInterval keep-alive is unreliable in a service
     // worker, so the worker was evicted mid-swap: "message channel closed").
     isAuthorizedSender(sender)
-      .then((ok) => {
-        if (!ok) return sendResponse({ success: false, error: "not authorized" })
-        void setSwapJob({ status: "pending", startedAt: Date.now() })
-        void runSwapJob(message.params, sender)
-        sendResponse({ success: true, pending: true })
+      .then(async (ok) => {
+        const origin = senderOrigin(sender)
+        if (!ok || !origin) {
+          return sendResponse({ success: false, error: "not authorized" })
+        }
+        const jobId = Date.now() * 1000 + (++swapIdCounter % 1000)
+        await setSwapJob({
+          jobId,
+          origin,
+          status: "pending",
+          startedAt: Date.now()
+        })
+        void runSwapJob(jobId, origin, message.params)
+        sendResponse({ success: true, pending: true, jobId })
       })
       .catch((err) => sendResponse({ success: false, error: err.message }))
     return true
@@ -395,10 +404,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_SWAP_STATUS") {
     isAuthorizedSender(sender)
       .then((ok) => {
-        if (!ok) return sendResponse(null)
+        const origin = senderOrigin(sender)
+        if (!ok || !origin) return sendResponse(null)
         chrome.storage.session
           .get("swapJob")
-          .then((r) => sendResponse(r.swapJob ?? null))
+          .then((r) => {
+            const job = r.swapJob as SwapJob | undefined
+            if (!job || job.origin !== origin) return sendResponse(null)
+            if (typeof message.jobId === "number" && job.jobId !== message.jobId) {
+              return sendResponse(null)
+            }
+            sendResponse(job)
+          })
           .catch(() => sendResponse(null))
       })
       .catch(() => sendResponse(null))
@@ -737,6 +754,8 @@ function requestSwapApproval(
 // Swap job status, persisted so the page can poll it (GET_SWAP_STATUS) even
 // across worker restarts. One swap at a time.
 interface SwapJob {
+  jobId: number
+  origin: string
   status: "pending" | "done" | "error"
   result?: unknown
   error?: string
@@ -753,38 +772,36 @@ async function setSwapJob(job: SwapJob): Promise<void> {
 // GET_SWAP_STATUS polling is what keeps the worker alive through the approval +
 // the ~2-3 min swap.
 async function runSwapJob(
-  params: SwapRequestParams,
-  sender: chrome.runtime.MessageSender
+  jobId: number,
+  origin: string,
+  params: SwapRequestParams
 ): Promise<void> {
   try {
     // Starting a swap is activity: reset the idle clock so the 15-min auto-lock
     // measured from the LAST popup interaction can't fire in the middle of a
     // swap driven entirely from the dapp (popup closed).
     void recordActivity(Date.now())
-    const origin = senderOrigin(sender)
-    if (!origin) {
-      await setSwapJob({ status: "error", error: "unknown origin" })
-      return
-    }
     if (
       !params ||
       typeof params.outputMint !== "string" ||
       typeof params.amountLamports !== "string"
     ) {
-      await setSwapJob({ status: "error", error: "invalid params" })
+      await setSwapJob({ jobId, origin, status: "error", error: "invalid params" })
       return
     }
     const decision = requestSwapApproval(origin, params, 180_000)
     await openWalletWindow()
     const approved = await decision
     if (!approved) {
-      await setSwapJob({ status: "error", error: "rejected" })
+      await setSwapJob({ jobId, origin, status: "error", error: "rejected" })
       return
     }
     const result = await handlePrivateSwap(params)
-    await setSwapJob({ status: "done", result: result.data })
+    await setSwapJob({ jobId, origin, status: "done", result: result.data })
   } catch (e) {
     await setSwapJob({
+      jobId,
+      origin,
       status: "error",
       error: e instanceof Error ? e.message : String(e)
     })

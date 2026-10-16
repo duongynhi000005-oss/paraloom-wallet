@@ -6,6 +6,7 @@
 
 import { Connection, Keypair, PublicKey } from "@solana/web3.js"
 
+import { addressSpendPubHex } from "~lib/crypto/keyManagement"
 import {
   associatedTokenAddress,
   depositSpl,
@@ -47,6 +48,7 @@ export async function recoverReshields(
   shieldedAddress: string
 ): Promise<number> {
   let recovered = 0
+  const expectedSpendPubHex = addressSpendPubHex(shieldedAddress)
   const outputs = await listSwapOutputs()
   for (const o of outputs) {
     if (!o.reshield || !o.swapSignature || o.outputMint === "SOL") continue
@@ -57,7 +59,10 @@ export async function recoverReshields(
 
       // Case A: the deposit already landed — recover its note (blinding) from
       // the on-chain instruction so the balance is visible and spendable.
-      const rec = await recoverReshieldedNote(connection, o.freshAddress)
+      const rec = await recoverReshieldedNote(connection, o.freshAddress, {
+        expectedMint: o.outputMint,
+        expectedSpendPubHex
+      })
       if (rec) {
         await persistReshieldedNote(shieldedAddress, {
           assetId: await assetIdForMint(mintHex),

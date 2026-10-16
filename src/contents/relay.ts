@@ -45,7 +45,9 @@ window.addEventListener("message", (event: MessageEvent) => {
   if (typeof data.type !== "string" || !ALLOWED_TYPES.has(data.type)) return
 
   const reply = (result?: unknown, error?: string) => {
-    window.postMessage({ channel: RES, id: data.id, result, error }, event.origin || "*")
+    const targetOrigin =
+      event.origin && event.origin !== "null" ? event.origin : "*"
+    window.postMessage({ channel: RES, id: data.id, result, error }, targetOrigin)
   }
 
   try {

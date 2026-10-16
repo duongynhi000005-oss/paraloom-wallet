@@ -37,7 +37,11 @@ function relay(type: string, payload?: Record<string, unknown>): Promise<any> {
       else resolve(data.result)
     }
     window.addEventListener("message", onMessage)
-    window.postMessage({ channel: REQ, id, type, payload }, window.location.origin)
+    const targetOrigin =
+      window.location.origin && window.location.origin !== "null"
+        ? window.location.origin
+        : "*"
+    window.postMessage({ channel: REQ, id, type, payload }, targetOrigin)
   })
 }
 
@@ -93,13 +97,17 @@ if (!(window as any).paraloom) {
       // The polling keeps the MV3 worker alive through the approval + the
       // ~2-3 min swap; a single held response could not (worker eviction dropped
       // it as "message channel closed").
-      const ack = await relay("PRIVATE_SWAP", { params }).catch(() => null)
-      if (ack && ack.success === false) {
-        throw new Error(ack.error || "Private swap failed")
+      const ack = await relay("PRIVATE_SWAP", { params })
+      if (!ack || ack.success === false) {
+        throw new Error(ack?.error || "Private swap failed")
       }
+      const jobId = typeof ack.jobId === "number" ? ack.jobId : undefined
       for (let i = 0; i < 200; i++) {
         await new Promise((res) => setTimeout(res, 1500))
-        const st = await relay("GET_SWAP_STATUS").catch(() => null)
+        const st = await relay(
+          "GET_SWAP_STATUS",
+          jobId !== undefined ? { jobId } : undefined
+        ).catch(() => null)
         if (st?.status === "done") return st.result
         if (st?.status === "error") {
           throw new Error(st.error || "Private swap failed")
