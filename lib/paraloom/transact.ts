@@ -17,7 +17,10 @@ import {
   type Keypair
 } from "@solana/web3.js"
 
-import { confirmBySignatureStatus } from "./bridge"
+import {
+  assertCanonicalBn254FieldElement,
+  confirmBySignatureStatus
+} from "./bridge"
 import {
   BRIDGE_STATE_SEED,
   BRIDGE_VAULT_SEED,
@@ -43,6 +46,8 @@ function depositNoteInstructionData(
   pubkey: Uint8Array,
   blinding: Uint8Array
 ): Buffer {
+  assertCanonicalBn254FieldElement(pubkey, "pubkey")
+  assertCanonicalBn254FieldElement(blinding, "blinding")
   const data = new Uint8Array(8 + 8 + 32 + 32)
   data.set(DEPOSIT_NOTE_DISCRIMINATOR, 0)
   new DataView(data.buffer).setBigUint64(8, amountLamports, true)

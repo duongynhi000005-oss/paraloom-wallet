@@ -155,6 +155,51 @@ export function associatedTokenAddress(
   )[0]
 }
 
+// BN254 scalar field modulus p =
+// 21888242871839275222246405745257275088548364400416034343698204186575808495617
+// (0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001).
+// On-chain `deposit_note` and `deposit_note_spl` feed `pubkey` and `blinding`
+// into `solana_poseidon::hashv(Bn254X5, Endianness::LittleEndian, ...)` which
+// rejects any 32-byte little-endian integer >= p with InvalidFieldElement.
+export const BN254_FR_MODULUS =
+  21888242871839275222246405745257275088548364400416034343698204186575808495617n
+
+export function leBytesToBigInt(bytes: Uint8Array): bigint {
+  let acc = 0n
+  for (let i = bytes.length - 1; i >= 0; i--) {
+    acc = (acc << 8n) | BigInt(bytes[i])
+  }
+  return acc
+}
+
+export function isCanonicalBn254FieldElement(bytes: Uint8Array): boolean {
+  return bytes.length === 32 && leBytesToBigInt(bytes) < BN254_FR_MODULUS
+}
+
+export function assertCanonicalBn254FieldElement(
+  bytes: Uint8Array,
+  label: string
+): void {
+  if (bytes.length !== 32) {
+    throw new Error(`${label} must be 32 bytes (got ${bytes.length})`)
+  }
+  if (leBytesToBigInt(bytes) >= BN254_FR_MODULUS) {
+    throw new Error(
+      `${label} is not a canonical BN254 field element (< modulus p)`
+    )
+  }
+}
+
+// Sample a 32-byte little-endian random blinding guaranteed to be strictly
+// below the BN254 scalar field modulus p (top byte masked with 0x1f so the
+// value is < 2^253 < p, matching `depositV3` / `spendV3` in transactFlow.ts).
+export function randomFieldElement32(): Uint8Array {
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  b[31] &= 0x1f // stay well under the BN254 modulus
+  return b
+}
+
 // Layout: DEPOSIT_NOTE_SPL discriminator (8) | amount u64 LE (8) | pubkey (32) |
 // blinding (32) — identical arg shape to deposit_note, just the SPL variant.
 function depositSplInstructionData(
@@ -162,6 +207,8 @@ function depositSplInstructionData(
   pubkey: Uint8Array,
   blinding: Uint8Array
 ): Buffer {
+  assertCanonicalBn254FieldElement(pubkey, "pubkey")
+  assertCanonicalBn254FieldElement(blinding, "blinding")
   const data = new Uint8Array(8 + 8 + 32 + 32)
   data.set(DEPOSIT_NOTE_SPL_DISCRIMINATOR, 0)
   new DataView(data.buffer).setBigUint64(8, amount, true)
@@ -219,8 +266,7 @@ export async function depositSpl(
   onSubmitted?: (result: DepositResult) => Promise<void>
 ): Promise<DepositResult> {
   const recipient = hexToBytes(addressSpendPubHex(shieldedAddress))
-  const blinding = new Uint8Array(32)
-  crypto.getRandomValues(blinding)
+  const blinding = randomFieldElement32()
 
   const ata = associatedTokenAddress(depositor.publicKey, mint, tokenProgram)
   const ix = buildDepositSplInstruction(
@@ -382,8 +428,7 @@ export async function deposit(
   // commitment binds; `randomness` carries the note's blinding. The spend key
   // itself stays in the wallet (`wallet.spendPrivkey`).
   const recipient = hexToBytes(addressSpendPubHex(wallet.shieldedAddress))
-  const blinding = new Uint8Array(32)
-  crypto.getRandomValues(blinding)
+  const blinding = randomFieldElement32()
 
   const ix = buildDepositInstruction(signer.publicKey, amountLamports, recipient, blinding)
   const tx = new Transaction().add(ix)

@@ -32,7 +32,10 @@ function toHex(bytes: Uint8Array): string {
 }
 
 function randomHex32(): string {
-  return toHex(crypto.getRandomValues(new Uint8Array(32)))
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  b[31] &= 0x1f // stay well under the BN254 modulus
+  return toHex(b)
 }
 
 async function fetchPath(commitment: string): Promise<MerklePathResponse> {
